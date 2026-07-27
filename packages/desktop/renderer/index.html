@@ -1,0 +1,1150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tuneless</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+/* ═══════════════════════════════════════════════
+   DESIGN SYSTEM
+   ═══════════════════════════════════════════════ */
+:root {
+  --bg: #000000;
+  --surface: #111111;
+  --surface-2: #1a1a1a;
+  --surface-3: #242424;
+  --border: #2a2a2a;
+  --border-light: #333333;
+  --text: #ffffff;
+  --text-secondary: #999999;
+  --text-tertiary: #666666;
+  --text-quaternary: #444444;
+  --player-h: 72px;
+  --sidebar-w: 232px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --easing: cubic-bezier(0.4, 0, 0.2, 1);
+  --transition: 150ms var(--easing);
+  /* Typography scale */
+  --fs-xs: 10px;
+  --fs-sm: 11px;
+  --fs-base: 13px;
+  --fs-md: 14px;
+  --fs-lg: 15px;
+  --fs-xl: 18px;
+  --fs-2xl: 24px;
+  --fs-3xl: 32px;
+  /* Spacing scale (4px base) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: var(--fs-base);
+  line-height: 1.5;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-tertiary); }
+
+/* ── Selection ── */
+::selection { background: rgba(255,255,255,0.15); color: var(--text); }
+:focus-visible { outline: 1px solid var(--text-tertiary); outline-offset: 2px; }
+
+/* ── Splash ── */
+#splash {
+  position: fixed; inset: 0; background: var(--bg);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: var(--space-4); z-index: 9999;
+}
+#splash.hidden { display: none; }
+.splash-logo { font-size: var(--fs-2xl); font-weight: 300; letter-spacing: 6px; text-transform: uppercase; color: var(--text); }
+.splash-sub { font-size: var(--fs-sm); color: var(--text-tertiary); letter-spacing: 1px; }
+.spinner {
+  width: 18px; height: 18px;
+  border: 1.5px solid var(--surface-3);
+  border-top-color: var(--text);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Setup Screen ── */
+#setup {
+  position: fixed; inset: 0; background: var(--bg);
+  display: none; align-items: center; justify-content: center; z-index: 999;
+}
+#setup.visible { display: flex; }
+.setup-card {
+  width: 380px;
+  display: flex; flex-direction: column; align-items: center; gap: var(--space-6);
+}
+.setup-logo { font-size: 22px; font-weight: 300; letter-spacing: 5px; text-transform: uppercase; color: var(--text); }
+.setup-sub { font-size: var(--fs-sm); color: var(--text-tertiary); text-align: center; line-height: 1.7; }
+.setup-label { font-size: var(--fs-xs); color: var(--text-tertiary); letter-spacing: 1.5px; text-transform: uppercase; width: 100%; }
+.setup-input {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: 'Inter', sans-serif;
+  font-size: var(--fs-base);
+  padding: 11px 13px;
+  outline: none;
+  transition: border-color var(--transition);
+}
+.setup-input:focus { border-color: var(--text-tertiary); }
+.setup-input::placeholder { color: var(--text-quaternary); }
+.setup-btn {
+  width: 100%;
+  background: var(--text);
+  color: var(--bg);
+  border: none;
+  border-radius: var(--radius-sm);
+  font-family: 'Inter', sans-serif;
+  font-weight: 500;
+  font-size: var(--fs-base);
+  padding: 11px;
+  cursor: pointer;
+  transition: opacity var(--transition);
+}
+.setup-btn:hover { opacity: 0.85; }
+.setup-btn:active { transform: scale(0.99); }
+
+/* ── App Layout ── */
+#app { display: none; height: 100vh; flex-direction: column; }
+#app.visible { display: flex; }
+.app-layout { display: flex; flex: 1; overflow: hidden; }
+
+/* ── Sidebar ── */
+.sidebar {
+  width: var(--sidebar-w);
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  user-select: none;
+}
+.sidebar-header {
+  padding: var(--space-5) var(--space-5) var(--space-4);
+  font-size: var(--fs-md);
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+  -webkit-app-region: drag;
+}
+.sidebar-nav {
+  flex: 1;
+  padding: var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 9px 13px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: var(--fs-base);
+  font-weight: 400;
+  color: var(--text-secondary);
+  transition: all var(--transition);
+  border: none;
+  background: none;
+  width: 100%;
+  text-align: left;
+  font-family: 'Inter', sans-serif;
+  border-left: 2px solid transparent;
+}
+.nav-item:hover { color: var(--text); background: var(--surface-2); }
+.nav-item.active {
+  color: var(--text);
+  background: transparent;
+  font-weight: 500;
+  border-left-color: var(--text);
+}
+.nav-icon { font-size: 15px; width: 20px; text-align: center; flex-shrink: 0; opacity: 0.7; }
+.nav-item.active .nav-icon { opacity: 1; }
+.sidebar-footer {
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.key-hint { font-size: var(--fs-xs); color: var(--text-quaternary); letter-spacing: 0.3px; }
+.key-hint kbd, kbd.kb {
+  display: inline-block;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  font-family: inherit;
+  font-size: 9px;
+  background: var(--surface-2);
+  color: var(--text-tertiary);
+}
+
+/* ── Main Content ── */
+.main-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg);
+}
+.content-header {
+  display: flex;
+  align-items: center;
+  padding: var(--space-4) var(--space-6);
+  border-bottom: 1px solid var(--border);
+  gap: var(--space-4);
+  flex-shrink: 0;
+}
+.content-header .logo {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--text-quaternary);
+  display: none;
+}
+.search-wrap {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-3);
+  gap: var(--space-2);
+  max-width: 420px;
+  transition: border-color var(--transition);
+}
+.search-wrap:focus-within { border-color: var(--text-quaternary); }
+.search-wrap .search-icon { color: var(--text-quaternary); font-size: 14px; flex-shrink: 0; }
+.search-wrap input {
+  flex: 1;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-family: 'Inter', sans-serif;
+  font-size: var(--fs-base);
+  padding: 7px 0;
+}
+.search-wrap input::placeholder { color: var(--text-quaternary); }
+.search-clear {
+  background: none;
+  border: none;
+  color: var(--text-quaternary);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px;
+  display: none;
+  line-height: 1;
+  border-radius: 2px;
+  align-items: center;
+  justify-content: center;
+  transition: color var(--transition);
+}
+.search-clear:hover { color: var(--text-secondary); }
+.search-clear.visible { display: inline-flex; }
+
+.content-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding-bottom: calc(var(--player-h) + var(--space-2));
+}
+
+/* ── Empty/State Messages ── */
+.state-msg {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-12) var(--space-8);
+  gap: var(--space-3);
+  text-align: center;
+}
+.state-icon { font-size: 28px; opacity: 0.15; color: var(--text); }
+.state-title { font-size: var(--fs-md); color: var(--text-secondary); font-weight: 500; }
+.state-sub { font-size: var(--fs-sm); color: var(--text-tertiary); line-height: 1.7; max-width: 300px; }
+
+/* ── Section Header ── */
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-5) var(--space-6) var(--space-3);
+}
+.section-title {
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--text-tertiary);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.section-action {
+  font-size: var(--fs-sm);
+  color: var(--text-tertiary);
+  cursor: pointer;
+  background: none;
+  border: none;
+  font-family: inherit;
+  transition: color var(--transition);
+}
+.section-action:hover { color: var(--text); }
+
+/* ── Track List ── */
+.track-list { padding: 0; }
+.track-item {
+  display: flex;
+  align-items: center;
+  padding: var(--space-2) var(--space-6);
+  gap: var(--space-3);
+  cursor: pointer;
+  transition: background 100ms ease;
+  border-left: 2px solid transparent;
+  min-height: 52px;
+}
+.track-item:hover { background: var(--surface); }
+.track-item.playing {
+  background: rgba(255,255,255,0.03);
+  border-left-color: var(--text);
+}
+.track-item.playing .track-title { color: var(--text); }
+.track-thumb {
+  width: 40px;
+  height: 40px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--surface-2);
+  flex-shrink: 0;
+}
+.track-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.track-info { flex: 1; min-width: 0; }
+.track-title {
+  font-size: var(--fs-base);
+  font-weight: 400;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: color var(--transition);
+}
+.track-artist {
+  font-size: var(--fs-sm);
+  color: var(--text-quaternary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+.track-dur {
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-quaternary);
+  flex-shrink: 0;
+}
+
+/* ── Library ── */
+.library-content { padding: 0 var(--space-6) var(--space-2); }
+.import-zone {
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-6) var(--space-4);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+  transition: all var(--transition);
+  margin-bottom: var(--space-4);
+}
+.import-zone:hover { border-color: var(--text-quaternary); background: var(--surface); }
+.import-icon { font-size: 18px; opacity: 0.25; }
+.import-label { font-size: var(--fs-base); font-weight: 500; }
+.import-sub { font-size: var(--fs-sm); color: var(--text-tertiary); }
+.playlist-list {  }
+.playlist-item {
+  display: flex;
+  align-items: center;
+  padding: var(--space-3) 0;
+  gap: var(--space-3);
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  transition: background var(--transition);
+  margin: 0 calc(-1 * var(--space-6));
+  padding-left: var(--space-6);
+  padding-right: var(--space-6);
+}
+.playlist-item:hover { background: var(--surface); }
+.pl-art {
+  width: 44px; height: 44px;
+  border-radius: 2px;
+  background: var(--surface-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-size: 15px;
+  color: var(--text-quaternary);
+}
+.pl-info { flex: 1; min-width: 0; }
+.pl-name { font-size: var(--fs-base); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pl-meta { font-size: var(--fs-sm); color: var(--text-tertiary); margin-top: 2px; }
+.pl-actions { display: flex; gap: var(--space-2); flex-shrink: 0; }
+.pl-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-tertiary);
+  font-size: var(--fs-sm);
+  padding: 4px 11px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all var(--transition);
+}
+.pl-btn:hover { border-color: var(--text-quaternary); color: var(--text-secondary); }
+.pl-btn:active { transform: scale(0.97); }
+.pl-btn-del { border: none; color: var(--text-quaternary); font-size: 13px; padding: 4px 5px; cursor: pointer; background: none; font-family: inherit; transition: color var(--transition); }
+.pl-btn-del:hover { color: var(--text-secondary); }
+
+/* ── Playlist Detail ── */
+.pl-det-head {
+  display: flex;
+  align-items: center;
+  padding: var(--space-3) var(--space-6);
+  border-bottom: 1px solid var(--border);
+  gap: var(--space-3);
+}
+.pl-det-head .back-btn {
+  width: 32px; height: 32px;
+  display: flex; align-items: center; justify-content: center;
+  background: none; border: none; color: var(--text-tertiary);
+  font-size: 18px; cursor: pointer; border-radius: var(--radius-sm);
+  transition: all var(--transition);
+}
+.pl-det-head .back-btn:hover { color: var(--text); background: var(--surface-2); }
+#pl-filter {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: 'Inter', sans-serif;
+  font-size: var(--fs-base);
+  outline: none;
+  transition: border-color var(--transition);
+}
+#pl-filter:focus { border-color: var(--text-quaternary); }
+#pl-filter::placeholder { color: var(--text-quaternary); }
+
+/* ── Player Bar ���─ */
+.player {
+  height: var(--player-h);
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+.progress-track {
+  height: 2px;
+  background: var(--border);
+  cursor: pointer;
+  position: relative;
+}
+.progress-track:hover { height: 3px; }
+.progress-fill {
+  height: 100%;
+  background: var(--text);
+  border-radius: 1px;
+  transition: width 300ms linear;
+  pointer-events: none;
+}
+.player-inner {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  padding: 0 var(--space-4);
+  gap: var(--space-3);
+}
+.player-art {
+  width: 44px; height: 44px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--surface-2);
+  flex-shrink: 0;
+}
+.player-art img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.player-info {
+  flex: 1;
+  min-width: 0;
+  max-width: 280px;
+  cursor: pointer;
+}
+.player-title {
+  font-size: var(--fs-base);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.3;
+}
+.player-artist {
+  font-size: var(--fs-sm);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 1px;
+}
+.player-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.pc-btn {
+  background: none;
+  border: none;
+  color: var(--text-tertiary);
+  font-size: 15px;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+.pc-btn:hover { color: var(--text); background: var(--surface-2); }
+.pc-btn:active { transform: scale(0.92); }
+.pc-btn.play {
+  background: var(--text);
+  color: var(--bg);
+  font-size: 13px;
+  width: 36px;
+  height: 36px;
+}
+.pc-btn.play:hover { opacity: 0.88; background: var(--text); }
+.pc-btn.loading svg, .fp-ctrl.loading svg { animation: spin 0.8s linear infinite; }
+
+/* ── Volume Slider ── */
+.player-volume {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-shrink: 0;
+  width: 100px;
+}
+.player-volume .vol-icon { font-size: 13px; color: var(--text-quaternary); flex-shrink: 0; width: 16px; text-align: center; }
+.vol-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 3px;
+  background: var(--border);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+  transition: background var(--transition);
+}
+.vol-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text);
+  cursor: pointer;
+  transition: transform 100ms ease;
+}
+.vol-slider::-webkit-slider-thumb:hover { transform: scale(1.2); }
+.vol-slider:hover { background: var(--surface-3); }
+.vol-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text);
+  border: none;
+  cursor: pointer;
+}
+
+.player-time {
+  font-size: var(--fs-sm);
+  color: var(--text-quaternary);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+  min-width: 75px;
+  text-align: right;
+}
+.player-time.loading { animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { opacity: 0.3; } 50% { opacity: 0.7; } }
+
+/* ── Status Badge ── */
+.player-status-info {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--fs-xs);
+  color: var(--text-quaternary);
+}
+.status-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+.status-dot.playing { background: #1DB954; }
+.status-dot.loading { background: var(--text-quaternary); animation: pulse 0.8s ease-in-out infinite; }
+.status-dot.paused { background: var(--text-quaternary); }
+
+/* ── Full Screen Player ── */
+.full-player-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 500;
+  background: rgba(0,0,0,0.92);
+  display: none;
+  flex-direction: column;
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  animation: fpFadeIn 200ms ease;
+}
+@keyframes fpFadeIn { from { opacity: 0; } to { opacity: 1; } }
+.full-player-overlay.visible { display: flex; }
+
+.fp-close {
+  position: absolute;
+  top: var(--space-4);
+  right: var(--space-5);
+  z-index: 10;
+  background: var(--surface-2);
+  border: none;
+  color: var(--text-secondary);
+  font-size: 16px;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all var(--transition);
+}
+.fp-close:hover { background: var(--surface-3); color: var(--text); }
+
+.fp-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-12);
+  gap: var(--space-6);
+}
+
+.fp-art {
+  width: 320px;
+  height: 320px;
+  position: relative;
+  flex-shrink: 0;
+}
+.fp-art-backdrop {
+  position: absolute;
+  inset: -60px;
+  background-size: cover;
+  background-position: center;
+  filter: blur(50px) brightness(0.25);
+  opacity: 0.7;
+  transition: background-image 0.4s ease;
+  pointer-events: none;
+}
+.fp-art-image {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--surface-2);
+  box-shadow: 0 24px 80px rgba(0,0,0,0.6);
+}
+.fp-art-image img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.fp-art-image .fp-fallback {
+  width: 100%; height: 100%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 56px; color: var(--text-quaternary);
+}
+
+.fp-info { text-align: center; max-width: 480px; }
+.fp-title {
+  font-size: var(--fs-2xl);
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: var(--space-1);
+  line-height: 1.3;
+}
+.fp-artist {
+  font-size: var(--fs-lg);
+  color: var(--text-secondary);
+  font-weight: 400;
+}
+
+.fp-timeline {
+  width: 100%;
+  max-width: 480px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.fp-progress {
+  width: 100%;
+  height: 4px;
+  background: var(--surface-3);
+  border-radius: 2px;
+  cursor: pointer;
+  position: relative;
+  transition: height 100ms ease;
+}
+.fp-progress:hover { height: 6px; }
+.fp-progress-fill {
+  height: 100%;
+  background: var(--text);
+  border-radius: 2px;
+  transition: width 300ms linear;
+  pointer-events: none;
+}
+.fp-times {
+  display: flex;
+  justify-content: space-between;
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-quaternary);
+}
+
+.fp-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.fp-ctrl {
+  background: none;
+  border: none;
+  color: var(--text-tertiary);
+  font-size: 18px;
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+.fp-ctrl:hover { color: var(--text); background: var(--surface-2); }
+.fp-ctrl:active { transform: scale(0.92); }
+.fp-ctrl.primary {
+  background: var(--text);
+  color: var(--bg);
+  font-size: 18px;
+  width: 56px;
+  height: 56px;
+}
+.fp-ctrl.primary:hover { opacity: 0.88; background: var(--text); }
+.fp-ctrl.active { color: var(--text); }
+
+/* ── Queue (full player) ── */
+.fp-queue-toggle {
+  position: absolute;
+  bottom: var(--space-5);
+  left: 50%;
+  transform: translateX(-50%);
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-tertiary);
+  font-size: var(--fs-sm);
+  padding: 6px 16px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all var(--transition);
+}
+.fp-queue-toggle:hover { border-color: var(--text-quaternary); color: var(--text-secondary); }
+.fp-queue {
+  display: none;
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 45%;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  overflow-y: auto;
+  animation: queueSlideIn 200ms ease;
+}
+@keyframes queueSlideIn { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+.fp-queue.visible { display: block; }
+.fp-queue-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3) var(--space-5);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--fs-sm);
+  color: var(--text-tertiary);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  font-weight: 500;
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+  z-index: 1;
+}
+.fp-queue-item {
+  display: flex;
+  align-items: center;
+  padding: var(--space-2) var(--space-5);
+  gap: var(--space-3);
+  cursor: pointer;
+  transition: background var(--transition);
+}
+.fp-queue-item:hover { background: var(--surface-2); }
+.fp-queue-item.playing { background: rgba(255,255,255,0.04); }
+.fp-queue-item.playing .fp-qi-title { color: var(--text); }
+.fp-qi-thumb {
+  width: 34px;
+  height: 34px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--surface-2);
+  flex-shrink: 0;
+}
+.fp-qi-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.fp-qi-info { flex: 1; min-width: 0; }
+.fp-qi-title { font-size: var(--fs-sm); }
+.fp-qi-artist { font-size: var(--fs-xs); color: var(--text-quaternary); margin-top: 1px; }
+
+/* ── Toast ── */
+.toast {
+  position: fixed;
+  bottom: 90px;
+  left: 50%;
+  transform: translateX(-50%) translateY(16px);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 9px 16px;
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+  transition: all 250ms var(--easing);
+  z-index: 9999;
+  pointer-events: none;
+  opacity: 0;
+  white-space: nowrap;
+  max-width: 90vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* ── Audio ── */
+#audio-player { display: none; }
+
+/* ── Responsive ── */
+@media (max-width: 700px) {
+  .sidebar { display: none; }
+  .content-header .logo { display: block; }
+}
+</style>
+</head>
+<body>
+
+<!-- ── SVG Icon Sprite ── -->
+<svg style="display:none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Play -->
+    <symbol id="icon-play" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polygon points="6 3 20 12 6 21 6 3"/>
+    </symbol>
+    <!-- Pause -->
+    <symbol id="icon-pause" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>
+    </symbol>
+    <!-- Previous Track -->
+    <symbol id="icon-prev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polygon points="19 20 9 12 19 4 19 20"/><line x1="5" y1="19" x2="5" y2="5"/>
+    </symbol>
+    <!-- Next Track -->
+    <symbol id="icon-next" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polygon points="5 4 15 12 5 20 5 4"/><line x1="19" y1="5" x2="19" y2="19"/>
+    </symbol>
+    <!-- Shuffle -->
+    <symbol id="icon-shuffle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/>
+    </symbol>
+    <!-- Repeat (off icon) -->
+    <symbol id="icon-repeat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>
+    </symbol>
+    <!-- Repeat All -->
+    <symbol id="icon-repeat-all" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><circle cx="12" cy="12" r="1" fill="currentColor"/>
+    </symbol>
+    <!-- Repeat One -->
+    <symbol id="icon-repeat-one" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><text x="12" y="15" font-size="10" text-anchor="middle" fill="currentColor" stroke="none">1</text>
+    </symbol>
+    <!-- Heart (outline) -->
+    <symbol id="icon-heart" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
+    </symbol>
+    <!-- Heart (filled) -->
+    <symbol id="icon-heart-fill" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
+    </symbol>
+    <!-- Search -->
+    <symbol id="icon-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+    </symbol>
+    <!-- Library / List -->
+    <symbol id="icon-library" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>
+    </symbol>
+    <!-- Discover / Star -->
+    <symbol id="icon-discover" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+    </symbol>
+    <!-- Queue / List with play indicator -->
+    <symbol id="icon-queue" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><polygon points="3 5 6 7 3 9" fill="currentColor" stroke="none"/>
+    </symbol>
+    <!-- Settings / Gear -->
+    <symbol id="icon-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+    </symbol>
+    <!-- Volume High -->
+    <symbol id="icon-volume" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>
+    </symbol>
+    <!-- Volume Low -->
+    <symbol id="icon-volume-1" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+    </symbol>
+    <!-- Volume Muted -->
+    <symbol id="icon-volume-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="22" y1="9" x2="16" y2="15"/><line x1="16" y1="9" x2="22" y2="15"/>
+    </symbol>
+    <!-- Plus -->
+    <symbol id="icon-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+    </symbol>
+    <!-- Chevron Down -->
+    <symbol id="icon-chevron-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="6 9 12 15 18 9"/>
+    </symbol>
+    <!-- Chevron Up -->
+    <symbol id="icon-chevron-up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="18 15 12 9 6 15"/>
+    </symbol>
+    <!-- X / Close -->
+    <symbol id="icon-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+    </symbol>
+    <!-- Arrow Left -->
+    <symbol id="icon-arrow-left" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>
+    </symbol>
+    <!-- Check -->
+    <symbol id="icon-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="20 6 9 17 4 12"/>
+    </symbol>
+    <!-- Refresh -->
+    <symbol id="icon-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+    </symbol>
+    <!-- Music Note -->
+    <symbol id="icon-music" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
+    </symbol>
+  </defs>
+</svg>
+
+<!-- ── Splash ── -->
+<div id="splash">
+  <div class="splash-logo">Tuneless</div>
+  <div class="splash-sub">loading</div>
+  <div class="spinner"></div>
+</div>
+
+<!-- ── Setup ── -->
+<div id="setup">
+  <div class="setup-card">
+    <div class="setup-logo">Tuneless</div>
+    <div class="setup-sub">Desktop music player &middot; YouTube powered</div>
+    <label class="setup-label">YouTube Data API Key</label>
+    <input type="text" class="setup-input" id="api-key-input" placeholder="AIza..." autocomplete="off" spellcheck="false">
+    <button class="setup-btn" onclick="saveApiKey()">Start</button>
+    <div style="font-size:var(--fs-sm);color:var(--text-tertiary);line-height:1.7;text-align:center;max-width:340px">
+      Get a free key at console.cloud.google.com.
+      Enable YouTube Data API v3 &rarr; Credentials &rarr; Create API Key
+    </div>
+  </div>
+</div>
+
+<!-- ── App ── -->
+<div id="app">
+  <div class="app-layout">
+
+    <!-- Sidebar -->
+    <nav class="sidebar">
+      <div class="sidebar-header">Tuneless</div>
+      <div class="sidebar-nav">
+        <button class="nav-item active" data-tab="search">
+          <span class="nav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-search"/></svg></span> Search
+        </button>
+        <button class="nav-item" data-tab="library">
+          <span class="nav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-library"/></svg></span> Library
+        </button>
+        <button class="nav-item" data-tab="discover">
+          <span class="nav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-discover"/></svg></span> Discover
+        </button>
+        <button class="nav-item" data-tab="queue">
+          <span class="nav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-queue"/></svg></span> Queue
+        </button>
+        <button class="nav-item" data-tab="settings">
+          <span class="nav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-settings"/></svg></span> Settings
+        </button>
+      </div>
+      <div class="sidebar-footer">
+        <div class="key-hint"><kbd>Space</kbd> Play / Pause</div>
+        <div class="key-hint"><kbd>F</kbd> Full player</div>
+        <div class="key-hint"><kbd>&#x2318;K</kbd> Search</div>
+      </div>
+    </nav>
+
+    <!-- Main -->
+    <main class="main-content">
+      <div class="content-header">
+        <span class="logo">Tuneless</span>
+        <div class="search-wrap">
+          <span class="search-icon"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-search"/></svg></span>
+          <input type="text" id="search-input" placeholder="Search songs, artists..." autocomplete="off">
+          <button class="search-clear" id="search-clear" title="Clear"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-x"/></svg></button>
+        </div>
+      </div>
+      <div class="content-scroll" id="content"></div>
+    </main>
+  </div>
+
+  <!-- Player Bar -->
+  <div class="player" id="player-bar" style="display:none">
+    <div class="progress-track" onclick="seekTo(event)">
+      <div class="progress-fill" id="progress-fill"></div>
+    </div>
+    <div class="player-inner">
+      <div class="player-art"><img id="np-img" src="" alt="" style="display:none"></div>
+      <div class="player-info" onclick="openFullPlayer()">
+        <div class="player-title" id="np-title">&mdash;</div>
+        <div class="player-artist" id="np-artist">Nothing playing</div>
+      </div>
+      <button class="pc-btn" id="like-btn" onclick="toggleLike(queue[currentIdx]?.id)" title="Like" style="font-size:0;width:30px;height:30px"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-heart"/></svg></button>
+      <button class="pc-btn" onclick="showAddToPlaylistMenu()" title="Add to playlist" style="font-size:0;width:28px;height:28px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-plus"/></svg></button>
+      <div class="player-controls">
+        <button class="pc-btn" onclick="prevTrack()" title="Previous"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-prev"/></svg></button>
+        <button class="pc-btn play" id="play-btn" onclick="togglePlay()" title="Play/Pause"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-play"/></svg></button>
+        <button class="pc-btn" onclick="nextTrack()" title="Next"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-next"/></svg></button>
+      </div>
+      <div class="player-volume">
+        <span class="vol-icon" id="vol-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-volume"/></svg></span>
+        <input type="range" class="vol-slider" id="vol-slider" min="0" max="1" step="0.05" value="0.8">
+      </div>
+      <div class="player-time" id="player-time">0:00 / 0:00</div>
+    </div>
+  </div>
+</div>
+
+<!-- Full Screen Player -->
+<div class="full-player-overlay" id="full-player" onclick="if(event.target===this)closeFullPlayer()">
+  <button class="fp-close" onclick="closeFullPlayer()" title="Close"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-x"/></svg></button>
+  <div class="fp-content" onclick="event.stopPropagation()">
+    <div class="fp-art">
+      <div class="fp-art-backdrop" id="fp-art-backdrop"></div>
+      <div class="fp-art-image">
+        <div class="fp-fallback" id="fp-fallback"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.3"><use href="#icon-music"/></svg></div>
+        <img id="fp-img" src="" alt="" style="display:none">
+      </div>
+    </div>
+    <div class="fp-info">
+      <div class="fp-title" id="fp-title">&mdash;</div>
+      <div class="fp-artist" id="fp-artist">Nothing playing</div>
+    </div>
+    <div class="fp-timeline">
+      <div class="fp-progress" onclick="fpSeek(event)">
+        <div class="fp-progress-fill" id="fp-progress-fill"></div>
+      </div>
+      <div class="fp-times">
+        <span id="fp-current">0:00</span>
+        <span id="fp-total">0:00</span>
+      </div>
+    </div>
+    <div class="fp-controls">
+      <button class="fp-ctrl" id="fp-shuffle" onclick="toggleShuffle()" title="Shuffle"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-shuffle"/></svg></button>
+      <button class="fp-ctrl" onclick="prevTrack()" title="Previous"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-prev"/></svg></button>
+      <button class="fp-ctrl primary" id="fp-play-btn" onclick="togglePlay()" title="Play/Pause"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-play"/></svg></button>
+      <button class="fp-ctrl" onclick="nextTrack()" title="Next"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-next"/></svg></button>
+      <button class="fp-ctrl" id="fp-like-btn" onclick="toggleLike(queue[currentIdx]?.id)" title="Like"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-heart"/></svg></button>
+      <button class="fp-ctrl" id="fp-repeat" onclick="toggleRepeat()" title="Repeat"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-repeat"/></svg></button>
+    </div>
+  </div>
+  <button class="fp-queue-toggle" id="fp-queue-toggle" onclick="fpToggleQueue()">Queue <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><use href="#icon-chevron-up"/></svg></button>
+  <div class="fp-queue" id="fp-queue">
+    <div class="fp-queue-header">
+      <span>Up Next</span>
+      <span style="display:flex;align-items:center;gap:10px">
+        <span id="fp-q-count"></span>
+        <button onclick="fpToggleQueue()" title="Close" style="background:none;border:none;color:var(--text-quaternary);cursor:pointer;padding:0;line-height:1;font-family:inherit"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-x"/></svg></button>
+      </span>
+    </div>
+    <div id="fp-queue-list"></div>
+  </div>
+</div>
+
+<audio id="audio-player" preload="none"></audio>
+<div class="toast" id="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

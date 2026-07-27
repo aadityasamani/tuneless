@@ -1,0 +1,23 @@
+// Tuneless Color Palette
+export const colors = {
+  bg: '#0a0a0a',
+  surface: '#111111',
+  surface2: '#1a1a1a',
+  surface3: '#222222',
+  border: '#222222',
+  accent: '#c8f135',
+  accentDim: '#9ec428',
+  accentBg: 'rgba(200,241,53,0.08)',
+  text: '#f0f0f0',
+  textSecondary: '#888888',
+  textMuted: '#555555',
+  spotify: '#1DB954',
+  warning: '#f1a135',
+  error: '#e74c3c',
+  heart: '#e74c3c',
+  playerBg: 'rgba(10,10,10,0.97)',
+  progressBg: '#222222',
+  progressFill: '#c8f135',
+  shuffleOn: '#c8f135',
+  shuffleOff: '#555555',
+} as const;

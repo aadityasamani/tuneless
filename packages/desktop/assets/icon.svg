@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#000000;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1a1a1a;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Solid dark circle -->
+  <circle cx="256" cy="256" r="248" fill="url(#bg)"/>
+  <circle cx="256" cy="256" r="248" fill="none" stroke="#ffffff" stroke-width="4" opacity="0.08"/>
+
+  <!-- Bold "T" letter — modern, geometric, thick enough for any size -->
+  <!-- Horizontal bar -->
+  <rect x="160" y="170" width="192" height="36" rx="6" ry="6" fill="#ffffff"/>
+
+  <!-- Vertical stem — thick, clean -->
+  <rect x="238" y="170" width="36" height="182" rx="6" ry="6" fill="#ffffff"/>
+
+  <!-- Subtle accent: small play triangle suggestion at bottom-right of T -->
+  <path d="M 300 320 L 330 335 L 300 350 Z" fill="#ffffff" opacity="0.3"/>
+</svg>

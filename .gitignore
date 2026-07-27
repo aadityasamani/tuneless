@@ -1,0 +1,20 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+
+# Player debug scripts
+*-player-script.js
+
+# Android
+*.iml
+local.properties
+.gradle/
+build/
+*.apk
+*.aab
+
+# iOS
+Pods/
+*.xcworkspace
+*.xcuserstate

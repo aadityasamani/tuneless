@@ -1,0 +1,4 @@
+# Binary files — mark as LFS or just binary to avoid diff noise
+*.exe binary
+*.png binary
+*.ico binary

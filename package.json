@@ -1,0 +1,15 @@
+{
+  "name": "tuneless",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "packages/core",
+    "packages/desktop",
+    "packages/mobile"
+  ],
+  "scripts": {
+    "desktop": "npm start --workspace=packages/desktop",
+    "dist": "npm run dist --workspace=packages/desktop",
+    "mobile": "npm start --workspace=packages/mobile"
+  }
+}
