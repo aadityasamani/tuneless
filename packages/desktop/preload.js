@@ -8,6 +8,15 @@ contextBridge.exposeInMainWorld('tuneless', {
   playStream: (videoId) =>
     ipcRenderer.invoke('play:stream', { videoId }),
 
+  // Diagnostics
+  ytdlpVersion: () => ipcRenderer.invoke('ytdlp:version'),
+  ytdlpTest: (videoId) => ipcRenderer.invoke('ytdlp:test', { videoId }),
+
+  // Cookies (YouTube bot-check bypass)
+  cookiesStatus: () => ipcRenderer.invoke('cookies:status'),
+  cookiesImport: () => ipcRenderer.invoke('cookies:import'),
+  cookiesRemove: () => ipcRenderer.invoke('cookies:remove'),
+
   // Spotify API for recommendations
   spotifyToken: (clientId, clientSecret) =>
     ipcRenderer.invoke('spotify:token', { clientId, clientSecret }),

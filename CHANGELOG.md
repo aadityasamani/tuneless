@@ -2,6 +2,32 @@
 
 All notable changes to Tuneless will be documented here.
 
+## [2.0.5] — 2026-07-27
+
+### Added
+- **YouTube cookies support**: When YouTube blocks playback ("Sign in to confirm you're not a bot"),
+  you can now import a `cookies.txt` from Settings → YouTube Cookies. The app auto-uses it for all
+  extraction. This is the reliable fix for YouTube's anti-bot blocking.
+- **Fast, clear playback errors**: `play:stream` now pre-warms the stream cache and surfaces YouTube
+  bot-check / extraction failures as a clear toast + jump to Settings, instead of a silent
+  "Format error" from the audio element.
+
+### Fixed
+- **Proxy accepted cache-buster query strings**: `?format=fallback&v=...` now matches; previously any
+  extra query param made the proxy return 404, breaking the fallback path.
+- **Initial-load stall timer**: yt-dlp extraction (5–15s) no longer triggers the 3s stall logic.
+  Stall detection is now 15s during initial load, 3s for mid-playback stalls.
+- **Close actually quits the app**: removed the close-to-tray behavior that left a hidden process
+  playing audio and holding the stream port.
+- **Volume/mute desync**: crossfade no longer restores stale volume; clicking the speaker toggles mute.
+
+## [2.0.4] — 2026-07-27
+
+### Fixed
+- **yt-dlp option compatibility**: Removed `--reconnect` and `--reconnect-streamed`
+  flags which were removed in yt-dlp 2026.07.04. Every yt-dlp call was failing with
+  `no such option: --reconnect`, preventing all playback. Songs now play again.
+
 ## [2.0.3] — 2026-07-27
 
 ### Fixed

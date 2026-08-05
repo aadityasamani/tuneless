@@ -15,6 +15,10 @@ let _fallbackUrl = null;
 let _primaryUrl = null;
 let _usingFallback = false;
 
+// Volume tracking — keeps slider, mute state and audio element in sync
+let currentVol = parseFloat(localStorage.getItem('tl_volume') || '0.8');
+let isMuted = localStorage.getItem('tl_muted') === 'true';
+
 // Likes / Liked Songs
 let likedIds = new Set(JSON.parse(localStorage.getItem('tl_liked') || '[]'));
 let crossfadeSec = parseFloat(localStorage.getItem('tl_crossfade') || '3');
@@ -412,24 +416,40 @@ function bootApp() {
 
   // Volume control
   const volSlider = $('vol-slider');
-  const savedVol = parseFloat(localStorage.getItem('tl_volume') || '0.8');
-  audio.volume = savedVol;
-  volSlider.value = savedVol;
-  updateVolIcon(savedVol);
+  audio.volume = isMuted ? 0 : currentVol;
+  volSlider.value = currentVol;
+  updateVolIcon();
   volSlider.addEventListener('input', () => {
-    const v = parseFloat(volSlider.value);
-    audio.volume = v;
-    localStorage.setItem('tl_volume', v.toString());
-    updateVolIcon(v);
+    currentVol = parseFloat(volSlider.value);
+    isMuted = false;
+    localStorage.setItem('tl_muted', 'false');
+    audio.volume = currentVol;
+    localStorage.setItem('tl_volume', currentVol.toString());
+    updateVolIcon();
   });
+  // Click the speaker icon to toggle mute
+  $('vol-icon').parentElement.classList.add('vol-clickable');
+  $('vol-icon').parentElement.addEventListener('click', toggleMute);
 
   switchTab('search');
 }
 
-function updateVolIcon(v) {
+function toggleMute() {
+  isMuted = !isMuted;
+  localStorage.setItem('tl_muted', isMuted.toString());
+  if (isMuted) {
+    currentVol = audio.volume > 0 ? audio.volume : currentVol;
+    audio.volume = 0;
+  } else {
+    audio.volume = currentVol;
+  }
+  updateVolIcon();
+}
+
+function updateVolIcon() {
   const el = $('vol-icon');
-  if (v === 0) setIcon(el, 'volume-x', 14);
-  else if (v < 0.3) setIcon(el, 'volume-1', 14);
+  if (isMuted || audio.volume === 0) setIcon(el, 'volume-x', 14);
+  else if (audio.volume < 0.3) setIcon(el, 'volume-1', 14);
   else setIcon(el, 'volume', 14);
 }
 
@@ -459,9 +479,10 @@ audio.addEventListener('ended', () => {
     }, 1000);
   }
 });
-audio.addEventListener('timeupdate', () => { updateTimeDisplay(); clearStallTimer(); });
+audio.addEventListener('timeupdate', () => { _hasPlayedData = true; updateTimeDisplay(); clearStallTimer(); });
 let _stallTimer = null;
 let _stallRetries = 0;
+let _hasPlayedData = false; // true once this track has produced audio
 function clearStallTimer() { if (_stallTimer) { clearTimeout(_stallTimer); _stallTimer = null; } }
 
 // Seamless format fallback: switch from primary (M4A) to fallback URL
@@ -473,7 +494,8 @@ async function tryFallbackFormat() {
   const position = audio.currentTime || 0;
   const wasPlaying = !audio.paused;
   try {
-    audio.src = _fallbackUrl + '&t=' + Date.now();
+    // Use ?v= cache-buster (NOT &) — primary URL has no query string
+    audio.src = _fallbackUrl + '&v=' + Date.now();
     if (position > 0) audio.currentTime = position;
     if (wasPlaying) await audio.play();
     toast('Switched to alternate stream');
@@ -486,6 +508,9 @@ async function tryFallbackFormat() {
 
 function startStallTimer() {
   clearStallTimer();
+  // First load can take a while — yt-dlp has to extract the stream URL (5-15s).
+  // Only react fast (3s) for mid-playback stalls, where we already had audio.
+  const delay = _hasPlayedData ? 3000 : 15000;
   _stallTimer = setTimeout(async () => {
     clearStallTimer();
     _stallRetries++;
@@ -501,11 +526,14 @@ function startStallTimer() {
       try {
         const song = queue[currentIdx];
         const urls = await window.tuneless.playStream(song.id);
-        if (urls?.primary) {
+        if (urls?.error) {
+          console.warn('[audio] stream retry blocked:', urls.error);
+          toast('YouTube blocked playback — set up cookies in Settings');
+        } else if (urls?.primary) {
           _primaryUrl = urls.primary;
           _fallbackUrl = urls.fallback;
           _usingFallback = false;
-          audio.src = urls.primary + '&t=' + Date.now();
+          audio.src = urls.primary + '?v=' + Date.now();
           await audio.play();
           return;
         }
@@ -518,11 +546,11 @@ function startStallTimer() {
     _stallRetries = 0; _fallbackUrl = null; _primaryUrl = null;
     if (queue.length > 1) nextTrack();
     else { audio.pause(); audio.src = ''; isStreamLoading = false; updatePlayButtons(); }
-  }, 3000);
+  }, _hasPlayedData ? 3000 : 15000);
 }
 audio.addEventListener('waiting', () => { isStreamLoading = true; updatePlayButtons(); startStallTimer(); });
-audio.addEventListener('canplay', () => { isStreamLoading = false; updatePlayButtons(); clearStallTimer(); _stallRetries = 0; });
-audio.addEventListener('playing', () => { isStreamLoading = false; updatePlayButtons(); clearStallTimer(); _stallRetries = 0; });
+audio.addEventListener('canplay', () => { _hasPlayedData = true; isStreamLoading = false; updatePlayButtons(); clearStallTimer(); _stallRetries = 0; });
+audio.addEventListener('playing', () => { _hasPlayedData = true; isStreamLoading = false; updatePlayButtons(); clearStallTimer(); _stallRetries = 0; });
 audio.addEventListener('error', async (e) => {
   const errCode = audio.error ? audio.error.code : 0;
   const errMsg = audio.error && audio.error.message ? audio.error.message : 'unknown';
@@ -790,10 +818,25 @@ function renderSettings() {
       </div>
     </div>
     <div style="margin-top:24px">
+      <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">YouTube Cookies</div>
+      <div style="font-size:12px;color:var(--text-secondary);line-height:1.7;margin-bottom:10px">
+        YouTube sometimes blocks playback ("Sign in to confirm you're not a bot").
+        Fix it by exporting a cookies.txt from your browser (Get cookies.txt LOCALLY extension) and importing it here.
+      </div>
+      <div id="cookies-status" style="font-size:12px;color:var(--text-tertiary);margin-bottom:10px">Checking...</div>
+      <button class="setup-btn" style="margin-bottom:8px" onclick="importCookies()">Import cookies.txt</button>
+      <button class="setup-btn" id="cookies-remove-btn" style="display:none;background:transparent;color:var(--text-tertiary);border:1px solid var(--border)" onclick="removeCookies()">Remove cookies</button>
+    </div>
+    <div style="margin-top:24px">
+      <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">Diagnostics</div>
+      <button class="setup-btn" style="margin-bottom:8px" onclick="runDiagnostics()">Test Audio Pipeline</button>
+      <div id="diag-results" style="font-size:12px;color:var(--text-secondary);line-height:1.8;background:var(--surface);padding:12px;border-radius:4px;border:1px solid var(--border);white-space:pre-wrap;font-family:monospace;max-height:300px;overflow-y:auto"></div>
+    </div>
+    <div style="margin-top:24px">
       <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">About</div>
       <div style="font-size:13px;color:var(--text-secondary);line-height:1.8">
         Tuneless &mdash; desktop music player.<br>
-        Algorithmic recommendations &middot; yt-dlp audio &middot; v1.0.0
+        Algorithmic recommendations &middot; yt-dlp audio &middot; v2.0.4
       </div>
     </div>
   </div>`;
@@ -805,6 +848,8 @@ function renderSettings() {
       localStorage.setItem('tl_crossfade', crossfadeSec.toString());
     });
   }
+  // Show cookie status
+  updateCookiesStatus();
 }
 
 function renderPlaylistDetail(plId) {
@@ -945,11 +990,12 @@ function playFromQ(i) { currentIdx = i; playIndex(i); renderQueue(); saveSession
 
 async function playIndex(idx) {
   if (idx < 0 || idx >= queue.length) return;
-  clearStallTimer(); _stallRetries = 0;
+  clearStallTimer(); _stallRetries = 0; _hasPlayedData = false;
   const song = queue[idx]; if (!song) return;
 
   // Crossfade: fade out current audio before switching
-  if (crossfadeSec > 0 && audio.src && !audio.paused) {
+  // Skip when muted so we never restore stale volume
+  if (crossfadeSec > 0 && !isMuted && audio.src && !audio.paused) {
     const fadeSteps = 10;
     const fadeInterval = (crossfadeSec * 1000) / fadeSteps;
     const startVol = audio.volume;
@@ -958,16 +1004,30 @@ async function playIndex(idx) {
       await new Promise(r => setTimeout(r, fadeInterval));
     }
   }
-  audio.volume = parseFloat(localStorage.getItem('tl_volume') || '0.8');
+  audio.volume = isMuted ? 0 : currentVol;
 
   currentIdx = idx; updateNowPlaying(song); setPlayerLoading(true);
   addToRecentlyPlayed(song);
   try {
     const urls = await window.tuneless.playStream(song.id);
+    if (urls?.error) {
+      console.error('[playIndex] stream error:', urls.error);
+      setPlayerLoading(false);
+      _fallbackUrl = null; _primaryUrl = null;
+      const isBot = /bot-check|cookies/i.test(urls.error);
+      if (isBot) {
+        toast('YouTube blocked playback — set up cookies in Settings');
+        openCookiesSetup();
+      } else {
+        toast('Could not get audio stream: ' + urls.error);
+      }
+      return;
+    }
     if (!urls || !urls.primary) { toast('Could not get audio stream'); setPlayerLoading(false); return; }
     _primaryUrl = urls.primary;
     _fallbackUrl = urls.fallback;
     _usingFallback = false;
+    console.log('[playIndex] setting src:', _primaryUrl);
     audio.src = _primaryUrl;
     // Wait for the audio element to have enough data before playing
     await audio.play();
@@ -1300,6 +1360,98 @@ function updateKey() {
   if (k && !k.startsWith('AIza')) { toast('Key should start with AIza'); return; }
   API_KEY = k; localStorage.setItem('tl_api_key', k);
   renderSettings(); toast(k ? 'API key saved' : 'API key removed');
+}
+
+// ── DIAGNOSTICS ────────────────────────────────────────────────────────────
+// ── COOKIES (YouTube bot-check bypass) ─────────────────────────────────
+async function updateCookiesStatus() {
+  const el = $('cookies-status');
+  if (!el) return;
+  try {
+    const s = await window.tuneless.cookiesStatus();
+    if (s?.present) {
+      el.innerHTML = '<span style="color:#1DB954">●</span> cookies.txt active — streams use it';
+      const btn = $('cookies-remove-btn');
+      if (btn) btn.style.display = 'block';
+    } else {
+      el.innerHTML = '<span style="color:var(--text-quaternary)">○</span> No cookies.txt yet — import one if YouTube blocks playback';
+      const btn = $('cookies-remove-btn');
+      if (btn) btn.style.display = 'none';
+    }
+  } catch (e) {
+    el.textContent = 'Status unavailable: ' + e.message;
+  }
+}
+
+async function importCookies() {
+  try {
+    const r = await window.tuneless.cookiesImport();
+    toast(r?.ok ? r.message : (r?.message || 'Import failed'));
+    updateCookiesStatus();
+  } catch (e) {
+    toast('Import failed: ' + e.message);
+  }
+}
+
+async function removeCookies() {
+  try {
+    await window.tuneless.cookiesRemove();
+    toast('Cookies removed');
+    updateCookiesStatus();
+  } catch (e) {
+    toast('Remove failed: ' + e.message);
+  }
+}
+
+function openCookiesSetup() {
+  switchTab('settings');
+  const el = $('cookies-status');
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+async function runDiagnostics() {
+  const el = $('diag-results');
+  el.textContent = 'Running diagnostics...\n';
+  try {
+    // 1. Check yt-dlp version
+    el.textContent += '\n1. Checking yt-dlp... ';
+    const ver = await window.tuneless.ytdlpVersion();
+    el.textContent += ver + '\n';
+  } catch (e) {
+    el.textContent += 'ERROR: ' + e.message + '\n';
+  }
+  try {
+    // 2. Try to resolve a test video
+    el.textContent += '\n2. Testing stream extraction (Rick Astley)...\n';
+    const result = await window.tuneless.ytdlpTest('dQw4w9WgXcQ');
+    el.textContent += '   Primary URL: ' + (result.primary ? result.primary.slice(0,80) + '...' : 'FAILED') + '\n';
+    el.textContent += '   Fallback URL: ' + (result.fallback ? result.fallback.slice(0,80) + '...' : 'FAILED') + '\n';
+    el.textContent += '   Last resort: ' + (result.lastResort ? result.lastResort.slice(0,80) + '...' : 'FAILED') + '\n';
+    if (result.error) el.textContent += '   Errors: ' + result.error + '\n';
+    if (result.primary) el.textContent += '\n✅ yt-dlp works! Stream URLs extracted.\n';
+    else el.textContent += '\n❌ yt-dlp failed to extract any stream.\n';
+  } catch (e) {
+    el.textContent += '   ERROR: ' + e.message + '\n';
+  }
+  try {
+    // 3. Test stream proxy
+    el.textContent += '\n3. Testing stream proxy... ';
+    const resp = await fetch('http://127.0.0.1:18762/stream/dQw4w9WgXcQ', { method: 'HEAD' });
+    el.textContent += 'HTTP ' + resp.status + ' ' + resp.statusText + '\n';
+  } catch (e) {
+    el.textContent += 'NOT REACHABLE: ' + e.message + '\n';
+  }
+  try {
+    // 4. Check audio element support
+    el.textContent += '\n4. Audio element support:\n';
+    const a = document.createElement('audio');
+    el.textContent += '   canPlayType(aac/mp4): ' + (a.canPlayType('audio/mp4').replace('no', '❌').replace('maybe', '⚠️ maybe').replace('probably', '✅ probably')) + '\n';
+    el.textContent += '   canPlayType(mp3): ' + (a.canPlayType('audio/mpeg').replace('no', '❌').replace('maybe', '⚠��� maybe').replace('probably', '✅ probably')) + '\n';
+    el.textContent += '   canPlayType(ogg/opus): ' + (a.canPlayType('audio/ogg; codecs=opus').replace('no', '❌').replace('maybe', '⚠️ maybe').replace('probably', '✅ probably')) + '\n';
+    el.textContent += '   canPlayType(webm): ' + (a.canPlayType('audio/webm').replace('no', '❌').replace('maybe', '⚠️ maybe').replace('probably', '✅ probably')) + '\n';
+  } catch (e) {
+    el.textContent += '   ERROR: ' + e.message + '\n';
+  }
 }
 
 // ── TABS ─────────────────────────────────────────────────────────────────
