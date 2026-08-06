@@ -1147,6 +1147,18 @@ html, body {
 <audio id="audio-player" preload="none"></audio>
 <div class="toast" id="toast"></div>
 
+<!-- ── Prompt Modal (replaces native prompt() which is broken in Electron) ── -->
+<div id="prompt-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9000;display:none;align-items:center;justify-content:center;backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);padding:24px;width:360px;display:flex;flex-direction:column;gap:16px">
+    <div id="prompt-title" style="font-size:var(--fs-md);font-weight:500;color:var(--text)">Enter name</div>
+    <input type="text" id="prompt-input" class="setup-input" autocomplete="off" spellcheck="false" placeholder="Playlist name...">
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button id="prompt-cancel" class="pl-btn" style="padding:7px 16px">Cancel</button>
+      <button id="prompt-ok" class="setup-btn" style="width:auto;padding:7px 16px;margin:0">OK</button>
+    </div>
+  </div>
+</div>
+
 <script src="app.js"></script>
 </body>
 </html>

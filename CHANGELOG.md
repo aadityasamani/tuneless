@@ -2,6 +2,23 @@
 
 All notable changes to Tuneless will be documented here.
 
+## [2.0.7] — 2026-08-06
+
+### Fixed
+- **New Playlist button does nothing**: Electron does not support the native browser
+  `prompt()` function — it silently returns `null`, so the playlist creation code
+  exits without doing anything. Replaced all `prompt()` calls with a custom HTML
+  modal that works inside Electron. Also fixed "Add to Playlist" which had the same
+  issue and now shows a proper dropdown instead of a text prompt.
+
+## [2.0.6] — 2026-08-06
+
+### Fixed
+- **3:36 truncation — songs now play to the end**: Node.js `https.get` was throttled
+  to 32KB/s by YouTube's CDN while audio plays at 44KB/s. Buffer drained faster
+  than it filled, cutting off around 3:36. Fix: yt-dlp downloads the full audio
+  file to a temp directory at 740KB/s, proxy serves the complete file.
+
 ## [2.0.5] — 2026-07-27
 
 ### Added

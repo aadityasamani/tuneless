@@ -753,11 +753,42 @@ function renderLibrary() {
   if (fi) { fi.addEventListener('change', function() { if (this.files?.length) handleFiles(this.files); this.value = ''; }); }
 }
 
+// ── PROMPT MODAL (replaces native prompt() — broken in Electron) ──
+function showPrompt(title, placeholder, callback) {
+  const overlay = $('prompt-overlay');
+  const input = $('prompt-input');
+  const titleEl = $('prompt-title');
+  const okBtn = $('prompt-ok');
+  const cancelBtn = $('prompt-cancel');
+
+  titleEl.textContent = title;
+  input.value = '';
+  input.placeholder = placeholder || '';
+  overlay.style.display = 'flex';
+  setTimeout(() => input.focus(), 50);
+
+  function close(result) {
+    overlay.style.display = 'none';
+    okBtn.removeEventListener('click', onOk);
+    cancelBtn.removeEventListener('click', onCancel);
+    input.removeEventListener('keydown', onKey);
+    callback(result);
+  }
+  function onOk() { close(input.value); }
+  function onCancel() { close(null); }
+  function onKey(e) { if (e.key === 'Enter') close(input.value); if (e.key === 'Escape') close(null); }
+
+  okBtn.addEventListener('click', onOk);
+  cancelBtn.addEventListener('click', onCancel);
+  input.addEventListener('keydown', onKey);
+}
+
 function createNewPlaylist() {
-  const name = prompt('Playlist name:');
-  if (!name || !name.trim()) return;
-  const pl = { id: 'pl_'+Date.now()+'_'+Math.random().toString(36).slice(2), name: name.trim(), trackCount: 0, tracks: [] };
-  playlists.unshift(pl); savePls(); renderLibrary(); toast('Created "' + name.trim() + '"');
+  showPrompt('Playlist name:', 'My Playlist', (name) => {
+    if (!name || !name.trim()) return;
+    const pl = { id: 'pl_'+Date.now()+'_'+Math.random().toString(36).slice(2), name: name.trim(), trackCount: 0, tracks: [] };
+    playlists.unshift(pl); savePls(); renderLibrary(); toast('Created "' + name.trim() + '"');
+  });
 }
 
 function addCurrentToPlaylist(plId) {
@@ -774,12 +805,47 @@ function addCurrentToPlaylist(plId) {
 
 function showAddToPlaylistMenu() {
   if (!queue[currentIdx]) return;
-  const names = playlists.map(p => p.name);
-  if (!names.length) { createNewPlaylist(); return; }
-  const msg = 'Add "' + trunc(queue[currentIdx].title, 30) + '" to:\n' + names.map((n,i) => (i+1)+'. '+n).join('\n');
-  const choice = prompt(msg + '\n\nEnter number, or 0 to cancel');
-  const idx = parseInt(choice) - 1;
-  if (idx >= 0 && idx < playlists.length) addCurrentToPlaylist(playlists[idx].id);
+  if (!playlists.length) { createNewPlaylist(); return; }
+  // Build a select dropdown in the prompt modal
+  const overlay = $('prompt-overlay');
+  const input = $('prompt-input');
+  const titleEl = $('prompt-title');
+  const okBtn = $('prompt-ok');
+  const cancelBtn = $('prompt-cancel');
+
+  titleEl.textContent = 'Add to playlist:';
+  // Replace the text input with a select dropdown
+  input.style.display = 'none';
+  let select = document.getElementById('prompt-select');
+  if (!select) {
+    select = document.createElement('select');
+    select.id = 'prompt-select';
+    select.className = 'setup-input';
+    select.style.cssText = 'width:100%;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-family:Inter,sans-serif;font-size:var(--fs-base);padding:11px 13px;outline:none';
+    input.parentNode.insertBefore(select, input);
+  }
+  select.innerHTML = playlists.map((p, i) => `<option value="${i}">${esc(p.name)} (${p.trackCount} tracks)</option>`).join('');
+  select.style.display = 'block';
+
+  overlay.style.display = 'flex';
+  setTimeout(() => select.focus(), 50);
+
+  function close(idx) {
+    overlay.style.display = 'none';
+    select.style.display = 'none';
+    input.style.display = '';
+    okBtn.removeEventListener('click', onOk);
+    cancelBtn.removeEventListener('click', onCancel);
+    select.removeEventListener('change', onSelect);
+    if (idx >= 0 && idx < playlists.length) addCurrentToPlaylist(playlists[idx].id);
+  }
+  function onOk() { close(parseInt(select.value)); }
+  function onCancel() { close(-1); }
+  function onSelect() { close(parseInt(select.value)); }
+
+  okBtn.addEventListener('click', onOk);
+  cancelBtn.addEventListener('click', onCancel);
+  select.addEventListener('change', onSelect);
 }
 
 function renderQueue() {
@@ -836,7 +902,7 @@ function renderSettings() {
       <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">About</div>
       <div style="font-size:13px;color:var(--text-secondary);line-height:1.8">
         Tuneless &mdash; desktop music player.<br>
-        Algorithmic recommendations &middot; yt-dlp audio &middot; v2.0.4
+        Algorithmic recommendations &middot; yt-dlp audio &middot; v2.0.7
       </div>
     </div>
   </div>`;
