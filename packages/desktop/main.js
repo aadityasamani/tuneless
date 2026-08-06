@@ -76,7 +76,7 @@ function startStreamServer() {
     try {
       const formatArg = useFallback
         ? 'bestaudio[acodec!=opus]/bestaudio[ext=m4a]/bestaudio'
-        : 'bestaudio[ext=m4a]/bestaudio[acodec!=opus]/bestaudio';
+        : 'bestaudio[ext=m4a][abr>128]/bestaudio[ext=m4a]/bestaudio[acodec!=opus]/bestaudio';
       const ytdlpArgs = [
         '-f', formatArg,
         '-o', tempPath,
@@ -314,7 +314,7 @@ ipcMain.handle('play:stream', async (event, { videoId }) => {
   // AND download the full audio in one pass. The proxy serves the file
   // once the download completes (~4-6s for a 3:30 song at 740KB/s).
   try {
-    const formatArg = 'bestaudio[ext=m4a]/bestaudio[acodec!=opus]/bestaudio';
+    const formatArg = 'bestaudio[ext=m4a][abr>128]/bestaudio[ext=m4a]/bestaudio[acodec!=opus]/bestaudio';
     const ytdlpArgs = [
       '-f', formatArg,
       '-o', tempPath,

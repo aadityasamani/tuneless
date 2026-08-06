@@ -457,7 +457,11 @@ function updateVolIcon() {
 audio.addEventListener('play', () => {
   isPlaying = true; isStreamLoading = false;
   updatePlayButtons(); startProgress();
-  if (queue[currentIdx]) updateMediaSession(queue[currentIdx]);
+  // Restore artist name — setPlayerLoading overwrites it with "Loading stream..."
+  if (queue[currentIdx]) {
+    updateNowPlaying(queue[currentIdx]);
+    updateMediaSession(queue[currentIdx]);
+  }
 });
 audio.addEventListener('pause', () => {
   isPlaying = false; updatePlayButtons(); stopProgress();
@@ -942,15 +946,38 @@ function renderPlaylistDetail(plId) {
         style="width:100%;padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:inherit;font-size:13px;outline:none"
         value="${esc(_plFilter)}">
     </div>
-    <div class="track-list">`;
+    <div class="track-list" id="pl-tracks"></div>`;
 
+  $('content').innerHTML = html;
+  renderPlaylistTracks(pl, plId, filtered);
+  const filterEl = $('pl-filter');
+  if (filterEl) {
+    filterEl.addEventListener('input', () => {
+      _plFilter = filterEl.value.toLowerCase();
+      // Only re-render the track list, NOT the filter input — this preserves
+      // keyboard focus and avoids the space-character-loss bug where the
+      // entire content div was being replaced mid-keystroke.
+      const newFiltered = _plFilter
+        ? pl.tracks.filter(t => t.name.toLowerCase().includes(_plFilter) || t.artist.toLowerCase().includes(_plFilter))
+        : pl.tracks;
+      renderPlaylistTracks(pl, plId, newFiltered);
+      // Update the count in the header
+      const header = $('content').querySelector('.pl-det-head .pl-info div:last-child');
+      if (header) header.textContent = `${pl.trackCount} tracks · ${cached} cached · ${newFiltered.length} shown`;
+    });
+  }
+}
+
+function renderPlaylistTracks(pl, plId, filtered) {
+  const el = $('pl-tracks');
+  if (!el) return;
   if (!filtered.length) {
-    html += `<div class="state-msg" style="padding:40px"><div class="state-icon">&#x25CB;</div><div class="state-title">${hasFilter ? 'No matching tracks' : 'No tracks'}</div><div class="state-sub">${hasFilter ? 'Try a different search term' : 'This playlist is empty'}</div></div>`;
+    el.innerHTML = `<div class="state-msg" style="padding:40px"><div class="state-icon">&#x25CB;</div><div class="state-title">${_plFilter ? 'No matching tracks' : 'No tracks'}</div><div class="state-sub">${_plFilter ? 'Try a different search term' : 'This playlist is empty'}</div></div>`;
   } else {
-    filtered.forEach((t, i) => {
+    el.innerHTML = filtered.map((t, i) => {
       const isCurrentlyPlaying = queue[currentIdx]?.id === (t.ytId || '');
       const thumb = t.ytId ? getYtThumb(t.ytId) : '';
-      html += `<div class="track-item${isCurrentlyPlaying ? ' playing' : ''}" onclick="playPlaylistTrack('${plId}', ${pl.tracks.indexOf(t)})">
+      return `<div class="track-item${isCurrentlyPlaying ? ' playing' : ''}" onclick="playPlaylistTrack('${plId}', ${pl.tracks.indexOf(t)})">
         <div class="track-thumb">${thumb ? `<img src="${thumb}" loading="lazy">` : ''}</div>
         <div class="track-info">
           <div class="track-title">${esc(t.name)}${isCurrentlyPlaying ? ' <span style="color:var(--text-tertiary)">&#x25CF; playing</span>' : ''}</div>
@@ -958,23 +985,7 @@ function renderPlaylistDetail(plId) {
         </div>
         <div style="flex-shrink:0;display:flex;align-items:center;color:var(--text-tertiary)">${t.ytId ? '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-check"/></svg>' : '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-refresh"/></svg>'}</div>
       </div>`;
-    });
-  }
-  html += `</div>`;
-  $('content').innerHTML = html;
-  const filterEl = $('pl-filter');
-  if (filterEl) {
-    filterEl.addEventListener('input', () => {
-      _plFilter = filterEl.value.toLowerCase().trim();
-      renderPlaylistDetail(plId);
-      // Refocus filter after re-render — user is actively searching
-      const newFilter = $('pl-filter');
-      if (newFilter) {
-        newFilter.focus();
-        const len = newFilter.value.length;
-        newFilter.setSelectionRange(len, len);
-      }
-    });
+    }).join('');
   }
 }
 
