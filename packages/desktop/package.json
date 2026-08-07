@@ -14,11 +14,30 @@
     "appId": "com.tuneless.desktop",
     "productName": "Tuneless",
     "copyright": "Copyright © 2026 Tuneless",
-    "directories": { "output": "dist" },
-    "files": ["main.js", "preload.js", "renderer/**/*", "assets/**/*"],
-    "extraResources": [{"from": "yt-dlp.exe", "to": "yt-dlp.exe"}],
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "assets/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "yt-dlp.exe",
+        "to": "yt-dlp.exe"
+      }
+    ],
     "win": {
-      "target": [{"target": "nsis", "arch": ["x64"]}],
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
       "icon": "assets/icon.png"
     },
     "nsis": {
@@ -33,6 +52,7 @@
   },
   "dependencies": {
     "@distube/ytdl-core": "^4.16.12",
+    "@supabase/supabase-js": "^2.112.2",
     "youtubei.js": "^17.2.0"
   },
   "devDependencies": {
