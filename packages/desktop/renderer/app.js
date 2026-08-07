@@ -1107,7 +1107,7 @@ async function playPlaylistTrack(plId, trackIndex) {
   const song = { id: ytId, title: track.name, artist: track.artist, thumb: getYtThumb(ytId), duration: '' };
   const xi = queue.findIndex(q => q.id === ytId);
   currentIdx = xi >= 0 ? xi : (queue.push(song), queue.length - 1);
-  await playIndex(currentIdx);
+  await playIndex(currentIdx, true);
   renderPlaylistDetail(plId);
 }
 
@@ -1162,25 +1162,29 @@ async function playSearch(i) {
   const s = searchResults[i]; if (!s) return;
   const xi = queue.findIndex(q => q.id === s.id);
   currentIdx = xi >= 0 ? xi : (queue.push(s), queue.length - 1);
-  await playIndex(currentIdx); renderSearch(); saveSession();
+  await playIndex(currentIdx, true); renderSearch(); saveSession();
 }
-function playFromQ(i) { currentIdx = i; playIndex(i); renderQueue(); saveSession(); }
+function playFromQ(i) { currentIdx = i; playIndex(i, true); renderQueue(); saveSession(); }
 
-async function playIndex(idx) {
+async function playIndex(idx, manual) {
   if (idx < 0 || idx >= queue.length) return;
   clearStallTimer(); _stallRetries = 0; _hasPlayedData = false;
   const song = queue[idx]; if (!song) return;
 
-  // Crossfade: fade out current audio before switching
+  // Crossfade: only on auto-advance (song ending), NOT on manual skip
   // Skip when muted so we never restore stale volume
-  if (crossfadeSec > 0 && !isMuted && audio.src && !audio.paused) {
-    const fadeSteps = 10;
-    const fadeInterval = (crossfadeSec * 1000) / fadeSteps;
+  if (!manual && crossfadeSec > 0 && !isMuted && audio.src && !audio.paused) {
+    const fadeDuration = Math.min(crossfadeSec, 1.5); // cap at 1.5s even for auto
+    const fadeSteps = 8;
+    const fadeInterval = (fadeDuration * 1000) / fadeSteps;
     const startVol = audio.volume;
     for (let i = fadeSteps; i >= 0; i--) {
       audio.volume = startVol * (i / fadeSteps);
       await new Promise(r => setTimeout(r, fadeInterval));
     }
+  } else if (audio.src && !audio.paused) {
+    // Manual skip: cut instantly
+    audio.volume = 0;
   }
   audio.volume = isMuted ? 0 : currentVol;
 
@@ -1244,7 +1248,7 @@ function nextTrack() {
     next = currentIdx + 1;
     if (next >= queue.length) { if (repeatMode === 'all') next = 0; else return; }
   }
-  playIndex(next); if (tab === 'queue') renderQueue();
+  playIndex(next, true); if (tab === 'queue') renderQueue();
 }
 
 function prevTrack() {
@@ -1252,7 +1256,7 @@ function prevTrack() {
   if (audio.currentTime > 3) { audio.currentTime = 0; return; }
   let prev = currentIdx - 1;
   if (prev < 0) { if (repeatMode === 'all') prev = queue.length - 1; else return; }
-  playIndex(prev); if (tab === 'queue') renderQueue();
+  playIndex(prev, true); if (tab === 'queue') renderQueue();
 }
 
 function toggleShuffle() {
