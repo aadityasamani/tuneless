@@ -1198,10 +1198,13 @@ async function playIndex(idx, manual) {
       _fallbackUrl = null; _primaryUrl = null;
       const isBot = /bot-check|cookies/i.test(urls.error);
       if (isBot) {
-        toast('YouTube blocked playback — set up cookies in Settings');
-        openCookiesSetup();
+        toast('YouTube blocked this track — import cookies.txt in Settings to fix');
       } else {
         toast('Could not get audio stream: ' + urls.error);
+      }
+      // Skip to next track instead of redirecting away from current view
+      if (queue.length > 1) {
+        setTimeout(() => nextTrack(), 1500);
       }
       return;
     }
