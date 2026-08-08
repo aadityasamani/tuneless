@@ -1352,40 +1352,48 @@ async function playPl(plId, evt) {
   const btn = evt?.target?.closest('.pl-play-btn') || $('pl-play-btn');
   if (btn) { btn.classList.add('loading'); setIcon(btn, 'refresh', 20); }
 
-  // Separate cached and uncached tracks, preserving order
-  const ordered = [];
+  // Separate cached and uncached tracks
+  const tracks = [];
   for (const t of pl.tracks) {
-    if (t.ytId) { ordered.push(t); continue; }
-    const c = ytCache[cacheKey(t)]; if (c) { t.ytId = c; ordered.push(t); continue; }
-    ordered.push(t); // uncached, will resolve during playback
+    if (t.ytId) { tracks.push(t); continue; }
+    const c = ytCache[cacheKey(t)]; if (c) { t.ytId = c; tracks.push(t); continue; }
+    tracks.push(t); // uncached, will resolve during playback
   }
 
-  // Build queue in playlist order
+  // Shuffle if enabled (Fisher-Yates)
+  if (shuffleOn) {
+    for (let i = tracks.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [tracks[i], tracks[j]] = [tracks[j], tracks[i]];
+    }
+  }
+
+  // Build queue
   queue = [];
-  for (const t of ordered) {
+  for (const t of tracks) {
     if (t.ytId) queue.push({ id: t.ytId, title: t.name, artist: t.artist, thumb: getYtThumb(t.ytId || ''), duration: '' });
   }
 
   // If nothing is cached, resolve the first track immediately
-  if (!queue.length && ordered.length > 0) {
+  if (!queue.length && tracks.length > 0) {
     toast('Resolving tracks...');
     try {
-      const id = await window.tuneless.resolveTrack(ordered[0].name, ordered[0].artist, API_KEY);
-      if (id) { ordered[0].ytId = id; ytCache[cacheKey(ordered[0])] = id; queue.push({ id, title: ordered[0].name, artist: ordered[0].artist, thumb: getYtThumb(id), duration: '' }); }
+      const id = await window.tuneless.resolveTrack(tracks[0].name, tracks[0].artist, API_KEY);
+      if (id) { tracks[0].ytId = id; ytCache[cacheKey(tracks[0])] = id; queue.push({ id, title: tracks[0].name, artist: tracks[0].artist, thumb: getYtThumb(id), duration: '' }); }
     } catch (e) { console.error('[playPl] resolve failed:', e); }
   }
 
   // Play first track
   currentIdx = -1;
   if (queue.length > 0) {
-    await playIndex(0);
-    toast(`▶ Playing ${pl.name}`);
+    await playIndex(0, true);
+    toast(`▶ Playing ${pl.name}${shuffleOn ? ' (shuffled)' : ''}`);
   } else {
     toast('Could not resolve any tracks. Check your API key.');
   }
 
   // Background resolve remaining uncached tracks
-  const uncachedRemaining = ordered.slice(queue.length > 0 ? 1 : 0).filter(t => !t.ytId);
+  const uncachedRemaining = tracks.slice(queue.length > 0 ? 1 : 0).filter(t => !t.ytId);
   if (uncachedRemaining.length > 0) {
     let resolvedCount = 0;
     for (const t of uncachedRemaining) {
@@ -1397,7 +1405,7 @@ async function playPl(plId, evt) {
     saveCache(); savePls();
     if (resolvedCount > 0) toast(`+${resolvedCount} tracks cached`);
   }
-  if (btn) { btn.classList.remove('loading'); setIcon(btn, 'play', 20); }
+  if (btn) { btn.classList.remove('loading'); setIcon(btn, isPlaying ? 'pause' : 'play', 20); }
 }
 
 async function shufflePl(plId, evt) {
@@ -1460,20 +1468,11 @@ async function shufflePl(plId, evt) {
   if (btn) btn.disabled = false;
 }
 
-async function toggleShuffleFromPlaylist(plId, evt) {
-  // Toggle shuffle state
+function toggleShuffleFromPlaylist(plId, evt) {
+  // Just toggle state — do NOT restart playback
   shuffleOn = !shuffleOn;
-
-  // Update all shuffle button UI states
   updateShuffleUI();
-
-  // If shuffle was just turned ON, play the playlist shuffled
-  if (shuffleOn) {
-    await shufflePl(plId, evt);
-  } else {
-    // If shuffle was turned OFF and something is playing, toast
-    toast('Shuffle off');
-  }
+  toast(shuffleOn ? '🔀 Shuffle on — next tracks will be random' : 'Shuffle off — playing in order');
 }
 
 function delPl(id) {
