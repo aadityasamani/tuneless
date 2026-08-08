@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, protocol, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const http = require('http');
 const https = require('https');
@@ -198,10 +198,6 @@ if (!gotTheLock) {
 }
 
 app.on('ready', () => {
-  // Register custom protocol for OAuth callbacks
-  protocol.registerHttpProtocol('tuneless', (request, callback) => {
-    callback({ url: request.url });
-  });
   try {
     startStreamServer();
   } catch (e) {
