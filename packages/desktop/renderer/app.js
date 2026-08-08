@@ -670,16 +670,16 @@ function extractAccentColor(imgUrl) {
 function updateNowPlaying(song) {
   if (!song) return;
   $('np-title').textContent = song.title;
-  $('np-artist').textContent = song.artist || 'Unknown';
+  $('np-artist').textContent = normalizeArtist(song.artist) || 'Unknown';
   // Update full-screen player metadata
   const fpTitle = $('fp-title');
   const fpArtist = $('fp-artist');
   if (fpTitle) fpTitle.textContent = song.title;
-  if (fpArtist) fpArtist.textContent = song.artist || 'Unknown';
+  if (fpArtist) fpArtist.textContent = normalizeArtist(song.artist) || 'Unknown';
   // Update credits section in full-screen player
   const creditArtist = $('fp-credit-artist');
   const creditImg = $('fp-credit-img');
-  if (creditArtist) creditArtist.textContent = song.artist || 'Unknown';
+  if (creditArtist) creditArtist.textContent = normalizeArtist(song.artist) || 'Unknown';
   const thumbUrl = song.thumb || getYtThumb(song.id);
   const img = $('np-img'), fpImg = $('fp-img'), fpFallback = $('fp-fallback');
   if (thumbUrl) {
@@ -694,7 +694,7 @@ function updateNowPlaying(song) {
     img.style.display = 'none'; fpImg.style.display = 'none'; fpFallback.style.display = 'flex';
     if (creditImg) creditImg.style.display = 'none';
   }
-  $('player-bar').style.display = 'flex';
+  $('player-bar').style.display = 'grid';
   updatePlayButtons();
   updateLikeButtons();
   // Extract accent color and apply gradient to full-screen player
@@ -911,17 +911,14 @@ function renderQueue() {
 
 function renderSettings() {
   if (tab !== 'settings') return;
-  const supaUrl = localStorage.getItem('tl_supabase_url') || '';
-  const supaKey = localStorage.getItem('tl_supabase_anon_key') || '';
-  const isConfigured = supaUrl && supaKey;
   const isLoggedIn = !!currentUser;
   const initials = currentUser?.email ? currentUser.email.slice(0, 2).toUpperCase() : '';
   const displayName = currentUser?.user_metadata?.full_name || currentUser?.email?.split('@')[0] || '';
 
   let html = `<div style="padding:24px;max-width:500px">`;
 
-  // Account section (if Supabase configured)
-  if (isConfigured) {
+  // Account section
+  {
     html += `<div class="account-card">
       <div class="account-header">
         <div class="account-avatar">${isLoggedIn ? esc(initials) : '?'}</div>
@@ -939,17 +936,6 @@ function renderSettings() {
   }
 
   html += `${API_KEY ? '' : '<div style="background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:12px 16px;margin-bottom:16px;font-size:12px;color:var(--text-secondary)">Set your YouTube API key to enable search and playback.</div>'}`
-
-  // Supabase config
-  html += `<div style="margin-bottom:24px">
-      <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">Cloud Sync (Supabase)</div>
-      <label class="auth-label" style="margin-bottom:4px">Project URL</label>
-      <input type="text" id="sett-supa-url" class="setup-input" value="${esc(supaUrl)}" placeholder="https://xxxxx.supabase.co" autocomplete="off" spellcheck="false" style="margin-bottom:8px">
-      <label class="auth-label" style="margin-bottom:4px">Anon Key</label>
-      <input type="text" id="sett-supa-key" class="setup-input" value="${esc(supaKey)}" placeholder="eyJhbG..." autocomplete="off" spellcheck="false">
-      <button class="setup-btn" style="margin-top:8px" onclick="saveSupabaseConfig()">Save & Connect</button>
-      ${isConfigured ? `<div style="margin-top:8px;font-size:11px;color:var(--text-tertiary)">● Connected to Supabase</div>` : ''}
-    </div>`;
 
   // YouTube API Key
   html += `<div style="margin-bottom:24px">
@@ -1082,7 +1068,7 @@ function renderPlaylistTracks(pl, plId, filtered) {
         <div class="track-thumb">${thumb ? `<img src="${thumb}" loading="lazy">` : ''}</div>
         <div class="track-info">
           <div class="track-title">${esc(t.name)}${isCurrentlyPlaying ? ' <span style="color:var(--text-tertiary)">&#x25CF; playing</span>' : ''}</div>
-          <div class="track-artist">${esc(t.artist || 'Unknown')}</div>
+          <div class="track-artist">${esc(normalizeArtist(t.artist) || 'Unknown')}</div>
         </div>
         <div style="flex-shrink:0;display:flex;align-items:center;color:var(--text-tertiary)">${t.ytId ? '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-check"/></svg>' : '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-refresh"/></svg>'}</div>
       </div>`;
@@ -1120,7 +1106,7 @@ function trackHtml(r, i, ctx) {
     <div class="track-thumb">${thumb ? `<img src="${esc(thumb)}" loading="lazy">` : ''}</div>
     <div class="track-info">
       <div class="track-title">${esc(r.title||r.name)}${isStreamLoading && playing ? ' <span style="color:var(--text-tertiary)">loading...</span>' : ''}</div>
-      <div class="track-artist">${esc(r.artist||'')}</div>
+      <div class="track-artist">${esc(normalizeArtist(r.artist)||'')}</div>
     </div>
     <div class="track-dur">${r.duration||''}</div>
     </div>
@@ -1322,7 +1308,7 @@ function updateFullPlayerQueue() {
     const playing = i === currentIdx; const thumb = t.thumb || getYtThumb(t.id);
     return `<div class="fp-queue-item${playing?' playing':''}" onclick="closeFullPlayer();playFromQ(${i})">
       <div class="fp-qi-thumb">${thumb ? `<img src="${thumb}" loading="lazy">` : ''}</div>
-      <div class="fp-qi-info"><div class="fp-qi-title">${esc(t.title||t.name)}</div><div class="fp-qi-artist">${esc(t.artist||'')}</div></div>
+      <div class="fp-qi-info"><div class="fp-qi-title">${esc(t.title||t.name)}</div><div class="fp-qi-artist">${esc(normalizeArtist(t.artist)||'')}</div></div>
     </div>`;
   }).join('');
 }
@@ -1564,7 +1550,7 @@ function renderDiscover() {
         <div class="track-thumb">${thumb ? `<img src="${thumb}" loading="lazy">` : ''}</div>
         <div class="track-info">
           <div class="track-title">${esc(t.title)}</div>
-          <div class="track-artist">${esc(t.artist)}</div>
+          <div class="track-artist">${esc(normalizeArtist(t.artist))}</div>
         </div>
         <div style="font-size:10px;color:var(--text-quaternary)">${timeAgo(t.playedAt)}</div>
       </div>`;
@@ -1591,7 +1577,7 @@ function renderDiscover() {
         <div class="track-thumb">${thumb ? `<img src="${thumb}" loading="lazy">` : ''}</div>
         <div class="track-info">
           <div class="track-title">${esc(t.title)}</div>
-          <div class="track-artist">${esc(t.artist)}</div>
+          <div class="track-artist">${esc(normalizeArtist(t.artist))}</div>
         </div>
         <div style="display:flex;gap:4px;flex-shrink:0">
           <button class="pc-btn" onclick="event.stopPropagation();addRecToQueue(${i})" title="Add to queue" style="font-size:0;width:26px;height:26px"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-plus"/></svg></button>
@@ -1802,7 +1788,7 @@ function renderHome() {
       html += `<div class="home-card" onclick="replayRecents(${i})">
         <div class="home-card-img"><img src="${esc(thumb)}" loading="lazy"><div class="home-card-gradient"></div>
         <button class="home-card-play" onclick="event.stopPropagation();replayRecents(${i})"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg></button></div>
-        <div class="home-card-info"><div class="home-card-title">${esc(t.title)}</div><div class="home-card-sub">${esc(t.artist)}</div></div>
+        <div class="home-card-info"><div class="home-card-title">${esc(t.title)}</div><div class="home-card-sub">${esc(normalizeArtist(t.artist))}</div></div>
       </div>`;
     });
     html += `</div>`;
@@ -1818,7 +1804,7 @@ function renderHome() {
       const dotClass = t._rec ? 'green' : 'gray';
       html += `<div class="up-next-row" onclick="playFromQ(${currentIdx + 1 + i})">
         <div class="up-next-thumb"><img src="${esc(thumb)}" loading="lazy"></div>
-        <div class="up-next-info"><div class="up-next-title">${esc(t.title)}</div><div class="up-next-artist">${esc(t.artist)}</div></div>
+        <div class="up-next-info"><div class="up-next-title">${esc(t.title)}</div><div class="up-next-artist">${esc(normalizeArtist(t.artist))}</div></div>
         <div class="up-next-dot ${dotClass}"></div>
       </div>`;
     });
@@ -1844,7 +1830,7 @@ function renderHome() {
     html += `<div class="section-header"><span class="section-title">Recently Resolved</span></div>`;
     html += `<div class="resolved-table"><div class="resolved-row header"><span class="resolved-cell">Track</span><span class="resolved-cell">Artist</span><span class="resolved-cell">Plays</span><span class="resolved-cell">Status</span></div>`;
     recentlyPlayed.slice(0, 10).forEach(t => {
-      html += `<div class="resolved-row" onclick="replayRecents(${recentlyPlayed.indexOf(t)})"><span class="resolved-cell">${esc(t.title)}</span><span class="resolved-cell" style="color:var(--text-muted)">${esc(t.artist)}</span><span class="resolved-cell" style="color:var(--text-muted)">${t.playCount || 1}</span><span class="resolved-status"><span class="resolved-dot ok"></span> Resolved</span></div>`;
+      html += `<div class="resolved-row" onclick="replayRecents(${recentlyPlayed.indexOf(t)})"><span class="resolved-cell">${esc(t.title)}</span><span class="resolved-cell" style="color:var(--text-muted)">${esc(normalizeArtist(t.artist))}</span><span class="resolved-cell" style="color:var(--text-muted)">${t.playCount || 1}</span><span class="resolved-status"><span class="resolved-dot ok"></span> Resolved</span></div>`;
     });
     html += `</div>`;
   }
@@ -1859,6 +1845,11 @@ function renderHome() {
 // ── UTILS ────────────────────────────────────────────────────────────────
 function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function trunc(s,n) { return s?.length > n ? s.slice(0,n)+'...' : s||''; }
+function normalizeArtist(a) {
+  if (!a) return '';
+  // Normalize separators: semicolons → commas, clean up spacing
+  return a.replace(/;\s*/g, ', ').replace(/\s*,\s*/g, ', ').trim();
+}
 let toastTimer;
 function toast(msg) { const el = $('toast'); el.textContent = msg; el.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('show'), 2500); }
 
@@ -2002,8 +1993,15 @@ async function handleAuthSignup() {
   btn.disabled = true; btn.textContent = 'Creating account...'; errEl.textContent = ''; sucEl.textContent = '';
   try {
     await sb().signUp(email, password, name);
-    sucEl.textContent = 'Account created! You can now sign in.';
-    setTimeout(() => switchAuthTab('login'), 1500);
+    // Auto sign-in after successful signup
+    try {
+      await sb().signIn(email, password);
+      // Auth change callback handles the rest (hides overlay, syncs)
+    } catch (signInErr) {
+      // If auto sign-in fails (e.g. email confirmation required), show message
+      sucEl.textContent = 'Account created! Please check your email, then sign in.';
+      setTimeout(() => switchAuthTab('login'), 1500);
+    }
   } catch (e) {
     errEl.textContent = e.message || 'Sign up failed';
   }
@@ -2034,6 +2032,43 @@ async function handleAuthSignOut() {
 
 function skipAuth() {
   $('auth-overlay').classList.remove('visible');
+}
+
+async function handleAuthGoogle() {
+  const supabaseUrl = 'https://nknoznglfiyzlahjsgbl.supabase.co';
+  const redirectUrl = 'tuneless://auth/callback';
+  try {
+    if (window.tuneless?.googleAuth) {
+      // Electron: use IPC to open Google OAuth in a separate window
+      const result = await window.tuneless.googleAuth(supabaseUrl, redirectUrl);
+      if (result?.ok) {
+        // Result handled by onGoogleAuthResult listener below
+      } else {
+        const errEl = $('auth-login-error');
+        if (errEl) errEl.textContent = result?.error || 'Google sign-in was cancelled';
+      }
+    } else {
+      // Fallback: redirect via Supabase (works in browser)
+      window.location.href = `${supabaseUrl}/auth/v1/authorize?provider=google&redirect_to=${encodeURIComponent(redirectUrl)}`;
+    }
+  } catch (e) {
+    const errEl = $('auth-login-error');
+    if (errEl) errEl.textContent = 'Google sign-in failed: ' + e.message;
+  }
+}
+
+// Listen for Google auth results from main process (Electron IPC)
+if (window.tuneless?.onGoogleAuthResult) {
+  window.tuneless.onGoogleAuthResult(async (data) => {
+    if (data?.access_token && data?.refresh_token) {
+      // Store tokens and create session
+      localStorage.setItem('tl_sb_access', data.access_token);
+      localStorage.setItem('tl_sb_refresh', data.refresh_token);
+      if (data.user) localStorage.setItem('tl_sb_user', JSON.stringify(data.user));
+      currentUser = data.user;
+      onUserLoggedIn();
+    }
+  });
 }
 
 // ── CLOUD SYNC ─────────────────────────────────────────────────────────

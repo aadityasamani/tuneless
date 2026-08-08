@@ -26,4 +26,10 @@ contextBridge.exposeInMainWorld('tuneless', {
     ipcRenderer.invoke('spotify:search', { query, clientId, clientSecret }),
   spotifyGenres: (clientId, clientSecret) =>
     ipcRenderer.invoke('spotify:genres', { clientId, clientSecret }),
+
+  // Google OAuth (Supabase)
+  googleAuth: (supabaseUrl, redirectUrl) =>
+    ipcRenderer.invoke('auth:google', { supabaseUrl, redirectUrl }),
+  onGoogleAuthResult: (callback) =>
+    ipcRenderer.on('auth:google-result', (event, data) => callback(data)),
 });

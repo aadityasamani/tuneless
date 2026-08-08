@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, protocol, shell } = require('electron');
 const path = require('path');
 const http = require('http');
 const https = require('https');
@@ -198,6 +198,10 @@ if (!gotTheLock) {
 }
 
 app.on('ready', () => {
+  // Register custom protocol for OAuth callbacks
+  protocol.registerHttpProtocol('tuneless', (request, callback) => {
+    callback({ url: request.url });
+  });
   try {
     startStreamServer();
   } catch (e) {
@@ -296,6 +300,109 @@ ipcMain.handle('cookies:remove', async () => {
   try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch {}
   COOKIES_PATH = null;
   return { ok: true };
+});
+
+// ── IPC: Google OAuth (Supabase) ───────────────────────────────────────
+ipcMain.handle('auth:google', async (event, { supabaseUrl, redirectUrl }) => {
+  return new Promise((resolve) => {
+    const authWindow = new BrowserWindow({
+      width: 500, height: 700,
+      webPreferences: { nodeIntegration: false, contextIsolation: true },
+      title: 'Sign in with Google',
+      parent: mainWindow,
+      modal: false,
+      autoHideMenuBar: true,
+    });
+
+    // Google OAuth via Supabase
+    const authUrl = `${supabaseUrl}/auth/v1/authorize?provider=google&redirect_to=${encodeURIComponent(redirectUrl)}`;
+    authWindow.loadURL(authUrl);
+
+    // Listen for navigation to our custom protocol callback
+    authWindow.webContents.on('will-navigate', (e, url) => {
+      if (url.startsWith('tuneless://')) {
+        e.preventDefault();
+        try {
+          const parsed = new URL(url);
+          const hash = parsed.hash.substring(1);
+          const params = new URLSearchParams(hash);
+          const accessToken = params.get('access_token');
+          const refreshToken = params.get('refresh_token');
+
+          if (accessToken && refreshToken) {
+            // Get user info from Supabase
+            https.get(`${supabaseUrl}/auth/v1/user`, {
+              headers: { Authorization: `Bearer ${accessToken}`, apikey: '' },
+            }, (res) => {
+              let data = '';
+              res.on('data', (c) => data += c);
+              res.on('end', () => {
+                try {
+                  const user = JSON.parse(data);
+                  mainWindow.webContents.send('auth:google-result', {
+                    access_token: accessToken,
+                    refresh_token: refreshToken,
+                    user,
+                  });
+                } catch {
+                  mainWindow.webContents.send('auth:google-result', {
+                    access_token: accessToken,
+                    refresh_token: refreshToken,
+                    user: null,
+                  });
+                }
+                authWindow.close();
+                resolve({ ok: true });
+              });
+            }).on('error', () => {
+              mainWindow.webContents.send('auth:google-result', {
+                access_token: accessToken,
+                refresh_token: refreshToken,
+                user: null,
+              });
+              authWindow.close();
+              resolve({ ok: true });
+            });
+          } else {
+            authWindow.close();
+            resolve({ ok: false, error: 'No tokens in callback' });
+          }
+        } catch (e) {
+          authWindow.close();
+          resolve({ ok: false, error: e.message });
+        }
+      }
+    });
+
+    // Also handle will-redirect (some OAuth flows use redirect instead of navigate)
+    authWindow.webContents.on('will-redirect', (e, url) => {
+      if (url.startsWith('tuneless://')) {
+        e.preventDefault();
+        // Same handling as will-navigate
+        try {
+          const parsed = new URL(url);
+          const hash = parsed.hash.substring(1);
+          const params = new URLSearchParams(hash);
+          const accessToken = params.get('access_token');
+          const refreshToken = params.get('refresh_token');
+          if (accessToken && refreshToken) {
+            mainWindow.webContents.send('auth:google-result', {
+              access_token: accessToken,
+              refresh_token: refreshToken,
+              user: null,
+            });
+          }
+        } catch {}
+        authWindow.close();
+        resolve({ ok: true });
+      }
+    });
+
+    // Handle window closed without auth
+    authWindow.on('closed', () => {
+      resolve({ ok: false, error: 'Window closed' });
+    });
+  });
 });
 
 // ── IPC: Stream + search + resolve ───────────────────────────────
