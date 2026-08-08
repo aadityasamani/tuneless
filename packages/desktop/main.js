@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, globalShortcut } = require('electron');
 const path = require('path');
 const http = require('http');
 const https = require('https');
@@ -176,6 +176,33 @@ function createWindow() {
     mainWindow.show();
   });
 
+  // Intercept Supabase password recovery / OAuth redirect on main window
+  mainWindow.webContents.on('will-navigate', (e, url) => {
+    if (url.startsWith('http://localhost') && url.includes('access_token=')) {
+      e.preventDefault();
+      // Extract tokens from the URL fragment and send to renderer
+      try {
+        const parsed = new URL(url);
+        const hash = parsed.hash.substring(1);
+        const params = new URLSearchParams(hash);
+        const accessToken = params.get('access_token');
+        const refreshToken = params.get('refresh_token');
+        const type = params.get('type');
+        if (accessToken) {
+          mainWindow.webContents.send('auth:recovery', {
+            access_token: accessToken,
+            refresh_token: refreshToken,
+            type: type,
+          });
+        }
+      } catch (err) {
+        console.error('[main] failed to parse recovery URL:', err);
+      }
+      // Navigate back to the app
+      mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+    }
+  });
+
   // Closing the window quits the app — no hidden background process.
   mainWindow.on('close', () => {
     // Ensure the stream server is torn down on the way out.
@@ -198,6 +225,11 @@ if (!gotTheLock) {
 }
 
 app.on('ready', () => {
+  // Register global media key shortcuts (for keyboards/headsets that don't use MediaSession)
+  globalShortcut.register('MediaPlayPause', () => { if (mainWindow) mainWindow.webContents.send('media:play-pause'); });
+  globalShortcut.register('MediaNextTrack', () => { if (mainWindow) mainWindow.webContents.send('media:next'); });
+  globalShortcut.register('MediaPreviousTrack', () => { if (mainWindow) mainWindow.webContents.send('media:prev'); });
+  globalShortcut.register('MediaStop', () => { if (mainWindow) mainWindow.webContents.send('media:stop'); });
   try {
     startStreamServer();
   } catch (e) {
@@ -209,6 +241,7 @@ app.on('window-all-closed', () => { app.quit(); });
 app.on('activate', () => { if (mainWindow) mainWindow.show(); });
 app.on('before-quit', () => {
   app.isQuitting = true;
+  globalShortcut.unregisterAll();
   if (streamServer) streamServer.close();
 });
 
@@ -399,6 +432,73 @@ ipcMain.handle('auth:google', async (event, { supabaseUrl, redirectUrl }) => {
       resolve({ ok: false, error: 'Window closed' });
     });
   });
+});
+
+// ── IPC: Spotify Playlist Import ────────────────────────────────────────
+ipcMain.handle('spotify:import-playlist', async (event, { clientId, clientSecret, playlistUrl }) => {
+  try {
+    // Extract playlist ID from URL
+    const match = playlistUrl.match(/playlist\/([a-zA-Z0-9]+)/);
+    if (!match) return { error: 'Invalid Spotify playlist URL' };
+    const playlistId = match[1];
+
+    // Get access token
+    const auth = Buffer.from(clientId + ':' + clientSecret).toString('base64');
+    const tokenData = await new Promise((resolve, reject) => {
+      const body = 'grant_type=client_credentials';
+      const req = https.request('https://accounts.spotify.com/api/token', {
+        method: 'POST',
+        headers: { 'Authorization': 'Basic ' + auth, 'Content-Type': 'application/x-www-urlencoded', 'Content-Length': body.length },
+      }, (res) => {
+        let d = ''; res.on('data', c => d += c);
+        res.on('end', () => { try { resolve(JSON.parse(d)); } catch { reject(new Error('Bad token response')); } });
+      });
+      req.on('error', reject);
+      req.write(body);
+      req.end();
+    });
+
+    if (!tokenData.access_token) return { error: 'Spotify auth failed' };
+
+    // Fetch playlist info
+    const plData = await new Promise((resolve, reject) => {
+      https.get(`https://api.spotify.com/v1/playlists/${playlistId}?fields=name,tracks.total`, {
+        headers: { 'Authorization': 'Bearer ' + tokenData.access_token },
+      }, (res) => {
+        let d = ''; res.on('data', c => d += c);
+        res.on('end', () => { try { resolve(JSON.parse(d)); } catch { reject(new Error('Bad playlist response')); } });
+      }).on('error', reject);
+    });
+
+    // Fetch all tracks (paginated, up to 500)
+    const tracks = [];
+    let offset = 0;
+    const limit = 100;
+    while (offset < Math.min(plData.tracks.total, 500)) {
+      const pageData = await new Promise((resolve, reject) => {
+        https.get(`https://api.spotify.com/v1/playlists/${playlistId}/tracks?offset=${offset}&limit=${limit}&fields=items(track(name,artists,album,duration_ms))`, {
+          headers: { 'Authorization': 'Bearer ' + tokenData.access_token },
+        }, (res) => {
+          let d = ''; res.on('data', c => d += c);
+          res.on('end', () => { try { resolve(JSON.parse(d)); } catch { reject(new Error('Bad tracks response')); } });
+        }).on('error', reject);
+      });
+      for (const item of (pageData.items || [])) {
+        const t = item.track;
+        if (!t) continue;
+        tracks.push({
+          name: t.name,
+          artist: t.artists.map(a => a.name).join(', '),
+          ytId: null,
+        });
+      }
+      offset += limit;
+    }
+
+    return { name: plData.name, trackCount: tracks.length, tracks };
+  } catch (e) {
+    return { error: e.message || 'Import failed' };
+  }
 });
 
 // ── IPC: Stream + search + resolve ───────────────────────────────

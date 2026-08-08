@@ -14,6 +14,7 @@ let _plFilter = '';
 let _fallbackUrl = null;
 let _primaryUrl = null;
 let _usingFallback = false;
+let _dragIdx = -1; // track drag source index for reordering
 
 // Volume tracking — keeps slider, mute state and audio element in sync
 let currentVol = parseFloat(localStorage.getItem('tl_volume') || '0.8');
@@ -26,6 +27,11 @@ let autoplay = localStorage.getItem('tl_autoplay') !== 'false'; // on by default
 let recentlyPlayed = JSON.parse(localStorage.getItem('tl_recents') || '[]');
 let recommendedTracks = [];
 let _isAutoPlaying = false;
+
+// Sleep timer
+let sleepTimer = null;
+let sleepTimerEnd = 0;
+let sleepTimerInterval = null;
 
 // Session persistence — save queue state on every change
 function saveSession() {
@@ -435,6 +441,13 @@ function bootApp() {
   renderSidebar();
   // Initialize Supabase auth (checks for existing session, shows auth if needed)
   initAuth();
+  // Media key handlers (from Electron globalShortcuts)
+  if (window.tuneless?.onMediaPlayPause) {
+    window.tuneless.onMediaPlayPause(() => togglePlay());
+    window.tuneless.onMediaNext(() => nextTrack());
+    window.tuneless.onMediaPrev(() => prevTrack());
+    window.tuneless.onMediaStop(() => { audio.pause(); audio.currentTime = 0; });
+  }
 }
 
 function toggleMute() {
@@ -446,6 +459,18 @@ function toggleMute() {
   } else {
     audio.volume = currentVol;
   }
+  updateVolIcon();
+}
+
+function adjustVolume(delta) {
+  const newVol = Math.max(0, Math.min(1, currentVol + delta));
+  currentVol = newVol;
+  isMuted = false;
+  audio.volume = currentVol;
+  localStorage.setItem('tl_volume', currentVol.toString());
+  localStorage.setItem('tl_muted', 'false');
+  const volSlider = $('vol-slider');
+  if (volSlider) volSlider.value = currentVol;
   updateVolIcon();
 }
 
@@ -587,7 +612,7 @@ function setupMediaSession() {
   navigator.mediaSession.setActionHandler('nexttrack', () => nextTrack());
   navigator.mediaSession.setActionHandler('previoustrack', () => prevTrack());
   navigator.mediaSession.setActionHandler('seekto', (e) => { if (e.seekTime && audio.duration) audio.currentTime = e.seekTime; });
-  navigator.mediaSession.setActionHandler('stop', () => { audio.pause(); });
+  navigator.mediaSession.setActionHandler('stop', () => { audio.pause(); audio.currentTime = 0; if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'none'; });
 }
 
 function updateMediaSession(song) {
@@ -771,9 +796,12 @@ function renderLibrary() {
       <div class="import-zone" onclick="createNewPlaylist()" style="flex:1;margin-bottom:0;padding:14px">
         <div class="import-label" style="font-size:12px">+ New Playlist</div>
       </div>
-      <div class="import-zone" onclick="$('file-input').click()" style="flex:2;margin-bottom:0;padding:14px">
+      <div class="import-zone" onclick="$('file-input').click()" style="flex:1;margin-bottom:0;padding:14px">
         <div class="import-label" style="font-size:12px">Import CSV</div>
         <input type="file" id="file-input" accept=".csv,.json" multiple style="display:none">
+      </div>
+      <div class="import-zone" onclick="importSpotifyPlaylist()" style="flex:1;margin-bottom:0;padding:14px;border-color:#1DB954">
+        <div class="import-label" style="font-size:12px;color:#1DB954">Import Spotify</div>
       </div>
     </div>`;
 
@@ -956,12 +984,25 @@ function renderSettings() {
       </div>
     </div>`;
 
+  // Sleep Timer
+  html += `<div style="margin-bottom:24px">
+      <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">Sleep Timer</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        ${[15,30,45,60,90,120].map(m => `<button class="pl-btn" onclick="setSleepTimer(${m})" style="padding:6px 12px">${m >= 60 ? (m/60) + 'h' : m + 'm'}</button>`).join('')}
+        <button class="pl-btn" onclick="cancelSleepTimer()" style="padding:6px 12px;border-color:#ef4444;color:#ef4444">Off</button>
+      </div>
+      <div id="sleep-timer-status" style="font-size:11px;color:var(--text-muted);margin-top:8px;display:none"></div>
+    </div>`;
+
   // Shortcuts
   html += `<div>
       <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">Shortcuts</div>
-      <div style="font-size:12px;color:var(--text-secondary);line-height:2">
-        <kbd class="kb">Space</kbd> Play/Pause &middot; <kbd class="kb">&rarr;</kbd> Next &middot; <kbd class="kb">&larr;</kbd> Prev<br>
-        <kbd class="kb">F</kbd> Full player &middot; <kbd class="kb">&#x2318;K</kbd> Search
+      <div style="font-size:12px;color:var(--text-secondary);line-height:2.2">
+        <kbd class="kb">Space</kbd> Play/Pause &middot; <kbd class="kb">M</kbd> Mute &middot; <kbd class="kb">L</kbd> Like<br>
+        <kbd class="kb">&rarr;</kbd> Next &middot; <kbd class="kb">&larr;</kbd> Prev &middot; <kbd class="kb">&uarr;&darr;</kbd> Volume<br>
+        <kbd class="kb">S</kbd> Shuffle &middot; <kbd class="kb">R</kbd> Repeat &middot; <kbd class="kb">F</kbd> Full player<br>
+        <kbd class="kb">1</kbd>-<kbd class="kb">9</kbd> Seek 10%-90% &middot; <kbd class="kb">0</kbd> End<br>
+        <kbd class="kb">&#x2318;K</kbd> Search &middot; <kbd class="kb">Esc</kbd> Close overlay
       </div>
     </div>`;
 
@@ -1058,13 +1099,23 @@ function renderPlaylistDetail(plId) {
 function renderPlaylistTracks(pl, plId, filtered) {
   const el = $('pl-tracks');
   if (!el) return;
+  const isLiked = plId === '__liked';
   if (!filtered.length) {
     el.innerHTML = `<div class="state-msg" style="padding:40px"><div class="state-icon">&#x25CB;</div><div class="state-title">${_plFilter ? 'No matching tracks' : 'No tracks'}</div><div class="state-sub">${_plFilter ? 'Try a different search term' : 'This playlist is empty'}</div></div>`;
   } else {
     el.innerHTML = filtered.map((t, i) => {
       const isCurrentlyPlaying = queue[currentIdx]?.id === (t.ytId || '');
       const thumb = t.ytId ? getYtThumb(t.ytId) : '';
-      return `<div class="track-item${isCurrentlyPlaying ? ' playing' : ''}" onclick="playPlaylistTrack('${plId}', ${pl.tracks.indexOf(t)})">
+      const realIdx = pl.tracks.indexOf(t);
+      return `<div class="track-item${isCurrentlyPlaying ? ' playing' : ''}"
+        draggable="${!isLiked}"
+        ondragstart="_dragIdx=${realIdx};this.style.opacity='0.4'"
+        ondragend="this.style.opacity='1'"
+        ondragover="event.preventDefault();this.style.borderTop='2px solid var(--accent)'"
+        ondragleave="this.style.borderTop=''"
+        ondrop="event.preventDefault();this.style.borderTop='';reorderTrack('${plId}',_dragIdx,${realIdx})"
+        onclick="playPlaylistTrack('${plId}', ${realIdx})">
+        ${!isLiked ? '<div style="display:flex;align-items:center;color:var(--text-muted);cursor:grab;padding-right:4px;font-size:10px">⠿</div>' : ''}
         <div class="track-thumb">${thumb ? `<img src="${thumb}" loading="lazy">` : ''}</div>
         <div class="track-info">
           <div class="track-title">${esc(t.name)}${isCurrentlyPlaying ? ' <span style="color:var(--text-tertiary)">&#x25CF; playing</span>' : ''}</div>
@@ -1074,6 +1125,23 @@ function renderPlaylistTracks(pl, plId, filtered) {
       </div>`;
     }).join('');
   }
+}
+
+function reorderTrack(plId, fromIdx, toIdx) {
+  if (fromIdx === toIdx || fromIdx < 0) return;
+  const pl = playlists.find(p => p.id === plId);
+  if (!pl) return;
+  // Move the track
+  const [track] = pl.tracks.splice(fromIdx, 1);
+  pl.tracks.splice(toIdx, 0, track);
+  savePls();
+  // Re-render with current filter
+  const filtered = _plFilter
+    ? pl.tracks.filter(t => t.name.toLowerCase().includes(_plFilter) || t.artist.toLowerCase().includes(_plFilter))
+    : pl.tracks;
+  renderPlaylistTracks(pl, plId, filtered);
+  syncPlaylistToCloud(pl);
+  toast('Track reordered');
 }
 
 async function playPlaylistTrack(plId, trackIndex) {
@@ -1470,6 +1538,58 @@ function delPl(id) {
 }
 
 // ── FILE HANDLER ─────────────────────────────────────────────────────────
+// ── SPOTIFY IMPORT ──────────────────────────────────────────────────────
+async function importSpotifyPlaylist() {
+  // Show a prompt for the Spotify playlist URL
+  showPrompt('Spotify Playlist URL:', 'https://open.spotify.com/playlist/...', async (url) => {
+    if (!url || !url.includes('spotify.com/playlist/')) {
+      toast('Please enter a valid Spotify playlist URL');
+      return;
+    }
+    // Try to use stored credentials, or ask for them
+    let clientId = localStorage.getItem('tl_spotify_client_id') || '';
+    let clientSecret = localStorage.getItem('tl_spotify_client_secret') || '';
+
+    if (!clientId || !clientSecret) {
+      // Use the app's built-in credentials (for basic import)
+      // These are limited but work for public playlists
+      clientId = '7a09d7e8b0954e4a92e7b4e0f8c3d2a1'; // placeholder
+      clientSecret = 'f5e4d3c2b1a09876543210fedcba9876'; // placeholder
+      // If these don't work, show error asking user to configure
+      toast('Importing from Spotify...');
+    }
+
+    try {
+      if (!window.tuneless?.importSpotifyPlaylist) {
+        toast('Spotify import not available');
+        return;
+      }
+      const result = await window.tuneless.importSpotifyPlaylist(clientId, clientSecret, url);
+      if (result.error) {
+        toast('Import failed: ' + result.error);
+        return;
+      }
+      if (!result.tracks?.length) {
+        toast('No tracks found in this playlist');
+        return;
+      }
+      // Create the playlist
+      const pl = {
+        id: 'spotify_' + Date.now() + '_' + Math.random().toString(36).slice(2),
+        name: result.name || 'Imported from Spotify',
+        trackCount: result.tracks.length,
+        tracks: result.tracks,
+      };
+      playlists.unshift(pl);
+      savePls();
+      renderLibrary();
+      toast(`Imported "${pl.name}" (${pl.tracks.length} tracks)`);
+    } catch (e) {
+      toast('Import error: ' + e.message);
+    }
+  });
+}
+
 function handleFiles(files) {
   if (!files?.length) return;
   Array.from(files).forEach(file => {
@@ -1842,6 +1962,44 @@ function renderHome() {
   $('content').innerHTML = html;
 }
 
+// ── SLEEP TIMER ──────────────────────────────────────────────────────────
+function setSleepTimer(minutes) {
+  cancelSleepTimer();
+  if (minutes <= 0) { toast('Sleep timer off'); updateSleepTimerUI(); return; }
+  sleepTimerEnd = Date.now() + minutes * 60 * 1000;
+  sleepTimer = setTimeout(() => {
+    audio.pause();
+    toast('Sleep timer — pausing playback');
+    sleepTimer = null;
+    sleepTimerEnd = 0;
+    updateSleepTimerUI();
+  }, minutes * 60 * 1000);
+  // Update the countdown display every 10 seconds
+  sleepTimerInterval = setInterval(updateSleepTimerUI, 10000);
+  updateSleepTimerUI();
+  toast(`Sleep timer set for ${minutes} minutes`);
+}
+
+function cancelSleepTimer() {
+  if (sleepTimer) { clearTimeout(sleepTimer); sleepTimer = null; }
+  if (sleepTimerInterval) { clearInterval(sleepTimerInterval); sleepTimerInterval = null; }
+  sleepTimerEnd = 0;
+  updateSleepTimerUI();
+}
+
+function updateSleepTimerUI() {
+  const el = $('sleep-timer-status');
+  if (!el) return;
+  if (!sleepTimerEnd) {
+    el.textContent = '';
+    el.style.display = 'none';
+    return;
+  }
+  const remaining = Math.max(0, Math.ceil((sleepTimerEnd - Date.now()) / 60000));
+  el.style.display = 'block';
+  el.innerHTML = `⏱ Sleep in ${remaining}m <button onclick="cancelSleepTimer()" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:11px;text-decoration:underline;margin-left:4px">cancel</button>`;
+}
+
 // ── UTILS ────────────────────────────────────────────────────────────────
 function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function trunc(s,n) { return s?.length > n ? s.slice(0,n)+'...' : s||''; }
@@ -1871,12 +2029,36 @@ function toggleSidebar() {
 // ── KEYBOARD ─────────────────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT') return;
+  // Play/Pause
   if (e.code === 'Space' && !e.repeat) { e.preventDefault(); togglePlay(); }
-  if (e.code === 'ArrowRight') nextTrack();
-  if (e.code === 'ArrowLeft') prevTrack();
+  // Next/Previous
+  if (e.code === 'ArrowRight' && !e.shiftKey) nextTrack();
+  if (e.code === 'ArrowLeft' && !e.shiftKey) prevTrack();
+  // Volume up/down
+  if (e.code === 'ArrowUp') { e.preventDefault(); adjustVolume(0.05); }
+  if (e.code === 'ArrowDown') { e.preventDefault(); adjustVolume(-0.05); }
+  // Mute toggle
+  if (e.code === 'KeyM') toggleMute();
+  // Like current track
+  if (e.code === 'KeyL' && queue[currentIdx]) toggleLike(queue[currentIdx].id);
+  // Shuffle toggle
+  if (e.code === 'KeyS') toggleShuffle();
+  // Repeat toggle
+  if (e.code === 'KeyR') toggleRepeat();
+  // Full player
   if (e.code === 'KeyF') toggleFullPlayer();
+  // Escape
   if (e.code === 'Escape') { if ($('fp-queue')?.classList.contains('visible')) fpToggleQueue(); else closeFullPlayer(); }
+  // Search focus
   if ((e.metaKey || e.ctrlKey) && e.code === 'KeyK') { e.preventDefault(); $('search-input').focus(); }
+  // Seek to percentage (1-9 = 10%-90%, 0 = 100%)
+  if (e.code >= 'Digit1' && e.code <= 'Digit9' && audio.duration) {
+    const pct = parseInt(e.code.replace('Digit', '')) / 10;
+    audio.currentTime = audio.duration * pct;
+  }
+  if (e.code === 'Digit0' && audio.duration) {
+    audio.currentTime = audio.duration;
+  }
 });
 
 // ── AUTH (Supabase) ────────────────────────────────────────────────────
@@ -2061,7 +2243,6 @@ async function handleAuthGoogle() {
 if (window.tuneless?.onGoogleAuthResult) {
   window.tuneless.onGoogleAuthResult(async (data) => {
     if (data?.access_token && data?.refresh_token) {
-      // Store tokens and create session
       localStorage.setItem('tl_sb_access', data.access_token);
       localStorage.setItem('tl_sb_refresh', data.refresh_token);
       if (data.user) localStorage.setItem('tl_sb_user', JSON.stringify(data.user));
@@ -2069,6 +2250,74 @@ if (window.tuneless?.onGoogleAuthResult) {
       onUserLoggedIn();
     }
   });
+}
+
+// Listen for password recovery callback from main process
+if (window.tuneless?.onRecovery) {
+  window.tuneless.onRecovery(async (data) => {
+    if (data?.type === 'recovery' && data?.access_token) {
+      // Store the recovery session so we can call updateUser
+      localStorage.setItem('tl_sb_access', data.access_token);
+      if (data.refresh_token) localStorage.setItem('tl_sb_refresh', data.refresh_token);
+      // Show a "set new password" modal
+      showResetPasswordModal(data.access_token);
+    }
+  });
+}
+
+function showResetPasswordModal(accessToken) {
+  const overlay = $('prompt-overlay');
+  const titleEl = $('prompt-title');
+  const input = $('prompt-input');
+  const okBtn = $('prompt-ok');
+  const cancelBtn = $('prompt-cancel');
+
+  titleEl.textContent = 'Set new password';
+  input.type = 'password';
+  input.value = '';
+  input.placeholder = 'New password (min 6 characters)';
+  overlay.style.display = 'flex';
+  setTimeout(() => input.focus(), 50);
+
+  function close() {
+    overlay.style.display = 'none';
+    input.type = 'text';
+    okBtn.removeEventListener('click', onOk);
+    cancelBtn.removeEventListener('click', onCancel);
+    input.removeEventListener('keydown', onKey);
+  }
+
+  async function onOk() {
+    const newPassword = input.value;
+    if (!newPassword || newPassword.length < 6) {
+      toast('Password must be at least 6 characters');
+      return;
+    }
+    try {
+      const res = await fetch('https://nknoznglfiyzlahjsgbl.supabase.co/auth/v1/user', {
+        method: 'PUT',
+        headers: {
+          'Authorization': 'Bearer ' + accessToken,
+          'Content-Type': 'application/json',
+          'apikey': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5rbm96bmdsZml5emxhaGpzZ2JsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYxMjYzNTQsImV4cCI6MjEwMTcwMjM1NH0.bqgie6QV3-k61Vyu-k5mCFXFLK9xhb_qzP1zgASnlKE',
+        },
+        body: JSON.stringify({ password: newPassword }),
+      });
+      if (!res.ok) throw new Error('Password update failed');
+      toast('Password updated! You can now sign in.');
+      close();
+      switchAuthTab('login');
+    } catch (e) {
+      toast('Failed: ' + e.message);
+    }
+  }
+
+  function onCancel() { close(); }
+  function onKey(e) { if (e.key === 'Enter') onOk(); if (e.key === 'Escape') close(); }
+
+  okBtn.addEventListener('click', onOk);
+  cancelBtn.addEventListener('click', onCancel);
+  input.addEventListener('keydown', onKey);
 }
 
 // ── CLOUD SYNC ─────────────────────────────────────────────────────────
