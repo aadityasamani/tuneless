@@ -485,6 +485,9 @@ function updateVolIcon() {
 audio.addEventListener('play', () => {
   isPlaying = true; isStreamLoading = false;
   updatePlayButtons(); startProgress();
+  // Ensure media session is active with correct state
+  setupMediaSession();
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
   // Restore artist name — setPlayerLoading overwrites it with "Loading stream..."
   if (queue[currentIdx]) {
     updateNowPlaying(queue[currentIdx]);
@@ -605,21 +608,24 @@ audio.addEventListener('error', async (e) => {
 });
 
 // ── MEDIA SESSION ────────────────────────────────────────────────────────
+let _mediaSessionSetup = false;
 function setupMediaSession() {
   if (!('mediaSession' in navigator)) return;
-  navigator.mediaSession.setActionHandler('play', () => togglePlay());
-  navigator.mediaSession.setActionHandler('pause', () => togglePlay());
+  if (_mediaSessionSetup) return; // only register handlers once
+  _mediaSessionSetup = true;
+  navigator.mediaSession.setActionHandler('play', () => { if (audio.src) audio.play(); });
+  navigator.mediaSession.setActionHandler('pause', () => { if (audio.src) audio.pause(); });
   navigator.mediaSession.setActionHandler('nexttrack', () => nextTrack());
   navigator.mediaSession.setActionHandler('previoustrack', () => prevTrack());
   navigator.mediaSession.setActionHandler('seekto', (e) => { if (e.seekTime && audio.duration) audio.currentTime = e.seekTime; });
-  navigator.mediaSession.setActionHandler('stop', () => { audio.pause(); audio.currentTime = 0; if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'none'; });
+  navigator.mediaSession.setActionHandler('stop', () => { audio.pause(); audio.currentTime = 0; navigator.mediaSession.playbackState = 'none'; });
 }
 
 function updateMediaSession(song) {
   if (!('mediaSession' in navigator)) return;
-  setupMediaSession();
+  setupMediaSession(); // ensure handlers are registered (idempotent)
   navigator.mediaSession.metadata = new MediaMetadata({
-    title: song.title || 'Unknown', artist: song.artist || '', album: 'Tuneless',
+    title: song.title || 'Unknown', artist: normalizeArtist(song.artist) || '', album: 'Tuneless',
     artwork: song.thumb
       ? [{ src: song.thumb, sizes: '480x480', type: 'image/jpeg' }]
       : [{ src: getYtThumb(song.id), sizes: '480x480', type: 'image/jpeg' }],
@@ -1280,18 +1286,23 @@ async function playIndex(idx, manual) {
 }
 
 function togglePlay() {
-  if (isStreamLoading) return;
+  // Reset stuck loading state — allows Bluetooth to always work
+  if (isStreamLoading && !audio.paused) { isStreamLoading = false; }
+
   if (audio.ended && audio.src) {
     // Song ended — restart it (or go next based on repeat mode)
     if (repeatMode === 'one') { audio.currentTime = 0; audio.play(); }
     else if (currentIdx + 1 < queue.length || repeatMode === 'all') nextTrack();
     else { audio.currentTime = 0; audio.play(); }
-  } else if (audio.paused && audio.src) {
-    audio.play();
-  } else if (!audio.paused) {
+  } else if (audio.src && !audio.paused) {
+    // Currently playing → pause
     audio.pause();
-  } else if (currentIdx >= 0) {
-    playIndex(currentIdx);
+  } else if (audio.src && audio.paused) {
+    // Currently paused → play
+    audio.play();
+  } else if (currentIdx >= 0 && queue.length > 0) {
+    // No audio loaded → start playing current track
+    playIndex(currentIdx, true);
   }
 }
 

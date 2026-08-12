@@ -1,6 +1,6 @@
 {
   "name": "@tuneless/desktop",
-  "version": "2.0.7",
+  "version": "2.1.0",
   "description": "Tuneless desktop music player",
   "author": "Aaditya Samani",
   "private": true,
@@ -47,6 +47,7 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Tuneless",
+      "runAfterFinish": false,
       "artifactName": "Tuneless-Setup-${version}.${ext}"
     }
   },

@@ -142,7 +142,7 @@
       const res = await fetch(SUPABASE_URL + '/auth/v1/recover', {
         method: 'POST',
         headers: { 'apikey': SUPABASE_ANON_KEY, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email }),
+        body: JSON.stringify({ email, redirect_to: 'tuneless://auth/callback' }),
       });
       if (!res.ok) throw new Error('Failed to send reset link');
     },

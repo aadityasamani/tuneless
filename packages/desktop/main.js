@@ -1,9 +1,12 @@
-const { app, BrowserWindow, ipcMain, dialog, globalShortcut } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, globalShortcut, protocol, net } = require('electron');
 const path = require('path');
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const { spawn, execFile } = require('child_process');
+
+// Register custom protocol BEFORE app is ready
+app.setAsDefaultProtocolClient('tuneless');
 
 const YOUTUBE_API_BASE = 'https://www.googleapis.com/youtube/v3';
 const STREAM_PORT = 18762;
@@ -158,10 +161,18 @@ function createWindow() {
   });
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 
-  // Show window when ready, with a fallback timeout
-  mainWindow.once('ready-to-show', () => mainWindow.show());
-  // Safety timeout — if page doesn't render in 10s, force show anyway
-  setTimeout(() => { if (mainWindow && !mainWindow.isVisible()) { mainWindow.show(); } }, 10000);
+  // Show window only when fully rendered — prevents blank/white flash
+  let shown = false;
+  mainWindow.once('ready-to-show', () => {
+    if (!shown) { shown = true; mainWindow.show(); }
+  });
+  // Fallback: if page doesn't render in 8s, show anyway (stream server may be downloading)
+  setTimeout(() => {
+    if (!shown && mainWindow && !mainWindow.isDestroyed()) {
+      shown = true;
+      mainWindow.show();
+    }
+  }, 8000);
 
   // Log renderer errors to help debug
   mainWindow.webContents.on('console-message', (event, level, message) => {
@@ -178,7 +189,9 @@ function createWindow() {
 
   // Intercept Supabase password recovery / OAuth redirect on main window
   mainWindow.webContents.on('will-navigate', (e, url) => {
-    if (url.startsWith('http://localhost') && url.includes('access_token=')) {
+    const isRecovery = (url.startsWith('http://localhost') || url.startsWith('tuneless://'))
+      && url.includes('access_token=');
+    if (isRecovery) {
       e.preventDefault();
       // Extract tokens from the URL fragment and send to renderer
       try {
@@ -216,6 +229,11 @@ if (!gotTheLock) {
   app.quit();
 } else {
   app.on('second-instance', (event, commandLine, workingDirectory) => {
+    // Extract deep link URL from command line (Windows sends tuneless:// URLs here)
+    const deepLink = commandLine.find(arg => arg.startsWith('tuneless://'));
+    if (deepLink && mainWindow) {
+      handleDeepLink(deepLink);
+    }
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.show();
@@ -223,6 +241,40 @@ if (!gotTheLock) {
     }
   });
 }
+
+// Handle deep link (custom protocol) URLs
+function handleDeepLink(url) {
+  try {
+    const parsed = new URL(url);
+    const hash = parsed.hash.substring(1);
+    const params = new URLSearchParams(hash);
+    const accessToken = params.get('access_token');
+    const refreshToken = params.get('refresh_token');
+    const type = params.get('type');
+    if (accessToken && mainWindow) {
+      mainWindow.webContents.send('auth:recovery', {
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        type: type,
+      });
+    }
+  } catch (e) {
+    console.error('[deep-link] failed to parse:', url, e);
+  }
+}
+
+// Also handle deep link on macOS/Linux (open-url event)
+app.on('open-url', (event, url) => {
+  event.preventDefault();
+  if (url.startsWith('tuneless://')) {
+    handleDeepLink(url);
+  }
+});
+
+// Disable GPU acceleration to prevent "not responding" after install
+// (GPU cache creation fails on fresh installs causing renderer hang)
+app.commandLine.appendSwitch('disable-gpu');
+app.commandLine.appendSwitch('disable-software-rasterizer');
 
 app.on('ready', () => {
   // Register global media key shortcuts (for keyboards/headsets that don't use MediaSession)
@@ -235,7 +287,8 @@ app.on('ready', () => {
   } catch (e) {
     console.error('[startup] stream server failed:', e.message);
   }
-  createWindow();
+  // Delay window creation slightly to let system settle after install
+  setTimeout(() => createWindow(), 500);
 });
 app.on('window-all-closed', () => { app.quit(); });
 app.on('activate', () => { if (mainWindow) mainWindow.show(); });
