@@ -26,4 +26,24 @@ contextBridge.exposeInMainWorld('tuneless', {
     ipcRenderer.invoke('spotify:search', { query, clientId, clientSecret }),
   spotifyGenres: (clientId, clientSecret) =>
     ipcRenderer.invoke('spotify:genres', { clientId, clientSecret }),
+
+  // Google OAuth (Supabase)
+  googleAuth: (supabaseUrl, redirectUrl) =>
+    ipcRenderer.invoke('auth:google', { supabaseUrl, redirectUrl }),
+  onGoogleAuthResult: (callback) =>
+    ipcRenderer.on('auth:google-result', (event, data) => callback(data)),
+
+  // Spotify playlist import
+  importSpotifyPlaylist: (clientId, clientSecret, playlistUrl) =>
+    ipcRenderer.invoke('spotify:import-playlist', { clientId, clientSecret, playlistUrl }),
+
+  // Password recovery callback
+  onRecovery: (callback) =>
+    ipcRenderer.on('auth:recovery', (event, data) => callback(data)),
+
+  // Media key handlers
+  onMediaPlayPause: (callback) => ipcRenderer.on('media:play-pause', () => callback()),
+  onMediaNext: (callback) => ipcRenderer.on('media:next', () => callback()),
+  onMediaPrev: (callback) => ipcRenderer.on('media:prev', () => callback()),
+  onMediaStop: (callback) => ipcRenderer.on('media:stop', () => callback()),
 });

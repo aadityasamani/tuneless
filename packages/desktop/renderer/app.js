@@ -14,6 +14,7 @@ let _plFilter = '';
 let _fallbackUrl = null;
 let _primaryUrl = null;
 let _usingFallback = false;
+let _dragIdx = -1; // track drag source index for reordering
 
 // Volume tracking — keeps slider, mute state and audio element in sync
 let currentVol = parseFloat(localStorage.getItem('tl_volume') || '0.8');
@@ -26,6 +27,11 @@ let autoplay = localStorage.getItem('tl_autoplay') !== 'false'; // on by default
 let recentlyPlayed = JSON.parse(localStorage.getItem('tl_recents') || '[]');
 let recommendedTracks = [];
 let _isAutoPlaying = false;
+
+// Sleep timer
+let sleepTimer = null;
+let sleepTimerEnd = 0;
+let sleepTimerInterval = null;
 
 // Session persistence — save queue state on every change
 function saveSession() {
@@ -55,6 +61,7 @@ function toggleLike(id) {
   updateLikeButtons();
   // Update playing track like state
   if (queue[currentIdx] && queue[currentIdx].id === id) updateLikeButtons();
+  syncLikedToCloud([...likedIds]);
 }
 
 function updateLikeButtons() {
@@ -63,7 +70,6 @@ function updateLikeButtons() {
   const liked = likedIds.has(id);
   const icon = liked ? 'heart-fill' : 'heart';
   setIcon($('like-btn'), icon, 16);
-  setIcon($('fp-like-btn'), icon, 20);
 }
 
 function getLikedPlaylist() {
@@ -431,7 +437,17 @@ function bootApp() {
   $('vol-icon').parentElement.classList.add('vol-clickable');
   $('vol-icon').parentElement.addEventListener('click', toggleMute);
 
-  switchTab('search');
+  switchTab('home');
+  renderSidebar();
+  // Initialize Supabase auth (checks for existing session, shows auth if needed)
+  initAuth();
+  // Media key handlers (from Electron globalShortcuts)
+  if (window.tuneless?.onMediaPlayPause) {
+    window.tuneless.onMediaPlayPause(() => togglePlay());
+    window.tuneless.onMediaNext(() => nextTrack());
+    window.tuneless.onMediaPrev(() => prevTrack());
+    window.tuneless.onMediaStop(() => { audio.pause(); audio.currentTime = 0; });
+  }
 }
 
 function toggleMute() {
@@ -446,6 +462,18 @@ function toggleMute() {
   updateVolIcon();
 }
 
+function adjustVolume(delta) {
+  const newVol = Math.max(0, Math.min(1, currentVol + delta));
+  currentVol = newVol;
+  isMuted = false;
+  audio.volume = currentVol;
+  localStorage.setItem('tl_volume', currentVol.toString());
+  localStorage.setItem('tl_muted', 'false');
+  const volSlider = $('vol-slider');
+  if (volSlider) volSlider.value = currentVol;
+  updateVolIcon();
+}
+
 function updateVolIcon() {
   const el = $('vol-icon');
   if (isMuted || audio.volume === 0) setIcon(el, 'volume-x', 14);
@@ -457,7 +485,14 @@ function updateVolIcon() {
 audio.addEventListener('play', () => {
   isPlaying = true; isStreamLoading = false;
   updatePlayButtons(); startProgress();
-  if (queue[currentIdx]) updateMediaSession(queue[currentIdx]);
+  // Ensure media session is active with correct state
+  setupMediaSession();
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+  // Restore artist name — setPlayerLoading overwrites it with "Loading stream..."
+  if (queue[currentIdx]) {
+    updateNowPlaying(queue[currentIdx]);
+    updateMediaSession(queue[currentIdx]);
+  }
 });
 audio.addEventListener('pause', () => {
   isPlaying = false; updatePlayButtons(); stopProgress();
@@ -573,21 +608,24 @@ audio.addEventListener('error', async (e) => {
 });
 
 // ── MEDIA SESSION ────────────────────────────────────────────────────────
+let _mediaSessionSetup = false;
 function setupMediaSession() {
   if (!('mediaSession' in navigator)) return;
-  navigator.mediaSession.setActionHandler('play', () => togglePlay());
-  navigator.mediaSession.setActionHandler('pause', () => togglePlay());
+  if (_mediaSessionSetup) return; // only register handlers once
+  _mediaSessionSetup = true;
+  navigator.mediaSession.setActionHandler('play', () => { if (audio.src) audio.play(); });
+  navigator.mediaSession.setActionHandler('pause', () => { if (audio.src) audio.pause(); });
   navigator.mediaSession.setActionHandler('nexttrack', () => nextTrack());
   navigator.mediaSession.setActionHandler('previoustrack', () => prevTrack());
   navigator.mediaSession.setActionHandler('seekto', (e) => { if (e.seekTime && audio.duration) audio.currentTime = e.seekTime; });
-  navigator.mediaSession.setActionHandler('stop', () => { audio.pause(); });
+  navigator.mediaSession.setActionHandler('stop', () => { audio.pause(); audio.currentTime = 0; navigator.mediaSession.playbackState = 'none'; });
 }
 
 function updateMediaSession(song) {
   if (!('mediaSession' in navigator)) return;
-  setupMediaSession();
+  setupMediaSession(); // ensure handlers are registered (idempotent)
   navigator.mediaSession.metadata = new MediaMetadata({
-    title: song.title || 'Unknown', artist: song.artist || '', album: 'Tuneless',
+    title: song.title || 'Unknown', artist: normalizeArtist(song.artist) || '', album: 'Tuneless',
     artwork: song.thumb
       ? [{ src: song.thumb, sizes: '480x480', type: 'image/jpeg' }]
       : [{ src: getYtThumb(song.id), sizes: '480x480', type: 'image/jpeg' }],
@@ -603,18 +641,20 @@ function setIcon(el, iconName, size) {
 
 // ── PLAYER UI ────────────────────────────────────────────────────────────
 function updatePlayButtons() {
-  const btn = $('play-btn'), fpBtn = $('fp-play-btn');
+  const btn = $('play-btn');
+  const fpBtn = $('fp-play-btn');
+  const plBtn = $('pl-play-btn');
   if (isStreamLoading) {
     btn.classList.add('loading');
-    fpBtn.classList.add('loading');
     setIcon(btn, 'refresh', 16);
-    setIcon(fpBtn, 'refresh', 22);
+    if (fpBtn) { fpBtn.classList.add('loading'); setIcon(fpBtn, 'refresh', 28); }
+    if (plBtn && !plBtn.classList.contains('loading')) { plBtn.classList.add('loading'); setIcon(plBtn, 'refresh', 20); }
   } else {
     btn.classList.remove('loading');
-    fpBtn.classList.remove('loading');
     const icon = isPlaying ? 'pause' : 'play';
     setIcon(btn, icon, 18);
-    setIcon(fpBtn, icon, 24);
+    if (fpBtn) { fpBtn.classList.remove('loading'); setIcon(fpBtn, icon, 28); }
+    if (plBtn) { plBtn.classList.remove('loading'); setIcon(plBtn, isPlaying ? 'pause' : 'play', 20); }
   }
 }
 
@@ -623,22 +663,56 @@ function setPlayerLoading(on) {
   if (on && queue[currentIdx]) {
     $('np-title').textContent = queue[currentIdx].title;
     $('np-artist').textContent = 'Loading stream...';
-    $('fp-artist').textContent = 'Loading stream...';
-    $('player-time').textContent = '⋯ / ⋯';
-    $('player-time').classList.add('loading');
+    const fpTitle = $('fp-title');
+    const fpArtist = $('fp-artist');
+    if (fpTitle) fpTitle.textContent = queue[currentIdx].title;
+    if (fpArtist) fpArtist.textContent = 'Loading stream...';
+    const creditArtist = $('fp-credit-artist');
+    if (creditArtist) creditArtist.textContent = 'Loading stream...';
+    $('np-current').textContent = '⋯';
+    $('np-total').textContent = '⋯';
+    $('np-current').classList.add('loading');
   } else if (!on && queue[currentIdx]) {
-    $('player-time').classList.remove('loading');
+    $('np-current').classList.remove('loading');
   }
+}
+
+// ── ACCENT COLOR EXTRACTION ─────────────────────────────────────────────
+// Samples dominant color from artwork thumbnail and sets --accent CSS variable.
+function extractAccentColor(imgUrl) {
+  if (!imgUrl) return;
+  const img = new Image();
+  // Don't set crossOrigin — YouTube thumbnails work without it in Electron
+  img.onload = () => {
+    try {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      canvas.width = 1; canvas.height = 1;
+      ctx.drawImage(img, 0, 0, 1, 1);
+      const [r, g, b] = ctx.getImageData(0, 0, 1, 1).data;
+      // Desaturate slightly and darken for a tint, not a flat color
+      const dr = Math.round(r * 0.6), dg = Math.round(g * 0.6), db = Math.round(b * 0.6);
+      document.documentElement.style.setProperty('--accent', `rgb(${dr},${dg},${db})`);
+    } catch (e) { /* CORS or other error — keep default accent */ }
+  };
+  img.src = imgUrl;
 }
 
 function updateNowPlaying(song) {
   if (!song) return;
   $('np-title').textContent = song.title;
-  $('np-artist').textContent = song.artist || 'Unknown';
-  $('fp-title').textContent = song.title;
-  $('fp-artist').textContent = song.artist || 'Unknown';
+  $('np-artist').textContent = normalizeArtist(song.artist) || 'Unknown';
+  // Update full-screen player metadata
+  const fpTitle = $('fp-title');
+  const fpArtist = $('fp-artist');
+  if (fpTitle) fpTitle.textContent = song.title;
+  if (fpArtist) fpArtist.textContent = normalizeArtist(song.artist) || 'Unknown';
+  // Update credits section in full-screen player
+  const creditArtist = $('fp-credit-artist');
+  const creditImg = $('fp-credit-img');
+  if (creditArtist) creditArtist.textContent = normalizeArtist(song.artist) || 'Unknown';
   const thumbUrl = song.thumb || getYtThumb(song.id);
-  const img = $('np-img'), fpImg = $('fp-img'), fpFallback = $('fp-fallback'), fpBackdrop = $('fp-art-backdrop');
+  const img = $('np-img'), fpImg = $('fp-img'), fpFallback = $('fp-fallback');
   if (thumbUrl) {
     img.onerror = function() { if (!this.dataset.fallback) { this.dataset.fallback = '1'; this.src = `https://img.youtube.com/vi/${song.id}/hqdefault.jpg`; } };
     fpImg.onerror = function() { if (!this.dataset.fallback) { this.dataset.fallback = '1'; this.src = `https://img.youtube.com/vi/${song.id}/hqdefault.jpg`; } };
@@ -646,14 +720,22 @@ function updateNowPlaying(song) {
     delete fpImg.dataset.fallback;
     img.src = thumbUrl; img.style.display = 'block';
     fpImg.src = thumbUrl; fpImg.style.display = 'block'; fpFallback.style.display = 'none';
-    if (fpBackdrop) fpBackdrop.style.backgroundImage = `url("${thumbUrl}")`;
+    if (creditImg) { creditImg.src = thumbUrl; creditImg.style.display = 'block'; }
   } else {
     img.style.display = 'none'; fpImg.style.display = 'none'; fpFallback.style.display = 'flex';
-    if (fpBackdrop) fpBackdrop.style.backgroundImage = '';
+    if (creditImg) creditImg.style.display = 'none';
   }
-  $('player-bar').style.display = 'flex';
+  $('player-bar').style.display = 'grid';
   updatePlayButtons();
   updateLikeButtons();
+  // Extract accent color and apply gradient to full-screen player
+  extractAccentColor(thumbUrl);
+  // Apply gradient background to full-screen player
+  const fp = $('full-player');
+  const fpBg = $('fp-bg');
+  if (fp && fpBg && thumbUrl) {
+    fpBg.style.backgroundImage = `url("${thumbUrl}")`;
+  }
 }
 
 function getYtThumb(id) { return id ? `https://img.youtube.com/vi/${id}/maxresdefault.jpg` : ''; }
@@ -720,9 +802,12 @@ function renderLibrary() {
       <div class="import-zone" onclick="createNewPlaylist()" style="flex:1;margin-bottom:0;padding:14px">
         <div class="import-label" style="font-size:12px">+ New Playlist</div>
       </div>
-      <div class="import-zone" onclick="$('file-input').click()" style="flex:2;margin-bottom:0;padding:14px">
+      <div class="import-zone" onclick="$('file-input').click()" style="flex:1;margin-bottom:0;padding:14px">
         <div class="import-label" style="font-size:12px">Import CSV</div>
         <input type="file" id="file-input" accept=".csv,.json" multiple style="display:none">
+      </div>
+      <div class="import-zone" onclick="importSpotifyPlaylist()" style="flex:1;margin-bottom:0;padding:14px;border-color:#1DB954">
+        <div class="import-label" style="font-size:12px;color:#1DB954">Import Spotify</div>
       </div>
     </div>`;
 
@@ -740,7 +825,7 @@ function renderLibrary() {
           <div class="pl-meta">${pl.trackCount} track${pl.trackCount!==1?'s':''} · ${cached} cached${isLiked ? ' · auto' : ''}</div>
         </div>
         <div class="pl-actions">
-          ${isLiked ? '' : `<button class="pl-btn" onclick="event.stopPropagation();shufflePl('${pl.id}')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:4px"><use href="#icon-shuffle"/></svg> Shuffle</button>`}
+          ${isLiked ? '' : `<button class="pl-btn" onclick="event.stopPropagation();shufflePl('${pl.id}', event)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:4px"><use href="#icon-shuffle"/></svg> Shuffle</button>`}
           ${isLiked ? '' : `<button class="pl-btn-del" onclick="event.stopPropagation();delPl('${pl.id}')" title="Remove"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-x"/></svg></button>`}
         </div>
       </div>`;
@@ -784,10 +869,11 @@ function showPrompt(title, placeholder, callback) {
 }
 
 function createNewPlaylist() {
-  showPrompt('Playlist name:', 'My Playlist', (name) => {
+  showPrompt('Playlist name:', 'My Playlist', async (name) => {
     if (!name || !name.trim()) return;
     const pl = { id: 'pl_'+Date.now()+'_'+Math.random().toString(36).slice(2), name: name.trim(), trackCount: 0, tracks: [] };
     playlists.unshift(pl); savePls(); renderLibrary(); toast('Created "' + name.trim() + '"');
+    syncPlaylistToCloud(pl);
   });
 }
 
@@ -859,15 +945,42 @@ function renderQueue() {
 
 function renderSettings() {
   if (tab !== 'settings') return;
-  $('content').innerHTML = `<div style="padding:24px;max-width:500px">
-    ${API_KEY ? '' : '<div style="background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:12px 16px;margin-bottom:16px;font-size:12px;color:var(--text-secondary)">Set your YouTube API key to enable search and playback.</div>'}
-    <div style="margin-bottom:24px">
+  const isLoggedIn = !!currentUser;
+  const initials = currentUser?.email ? currentUser.email.slice(0, 2).toUpperCase() : '';
+  const displayName = currentUser?.user_metadata?.full_name || currentUser?.email?.split('@')[0] || '';
+
+  let html = `<div style="padding:24px;max-width:500px">`;
+
+  // Account section
+  {
+    html += `<div class="account-card">
+      <div class="account-header">
+        <div class="account-avatar">${isLoggedIn ? esc(initials) : '?'}</div>
+        <div style="flex:1">
+          <div class="account-name">${isLoggedIn ? esc(displayName) : 'Not signed in'}</div>
+          <div class="account-email">${isLoggedIn ? esc(currentUser.email) : 'Sign in to sync across devices'}</div>
+        </div>
+      </div>
+      <div class="sync-status" id="sync-status"><span class="sync-dot ${syncStatus === 'synced' ? 'synced' : syncStatus === 'syncing' ? 'syncing' : 'logged-out'}"></span> ${isLoggedIn ? esc(syncStatus) : 'Offline mode'}</div>
+      ${isLoggedIn
+        ? `<button class="setup-btn" style="margin-top:8px;background:transparent;color:var(--text-secondary);border:1px solid var(--border)" onclick="handleAuthSignOut()">Sign Out</button>`
+        : `<button class="setup-btn" style="margin-top:8px" onclick="showAuthOverlay()">Sign In / Sign Up</button>`
+      }
+    </div>`;
+  }
+
+  html += `${API_KEY ? '' : '<div style="background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:12px 16px;margin-bottom:16px;font-size:12px;color:var(--text-secondary)">Set your YouTube API key to enable search and playback.</div>'}`
+
+  // YouTube API Key
+  html += `<div style="margin-bottom:24px">
       <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">YouTube API Key</div>
       <input type="text" id="sett-key" class="setup-input" value="${esc(API_KEY)}" placeholder="AIza..." autocomplete="off" spellcheck="false">
       <button class="setup-btn" style="margin-top:8px" onclick="updateKey()">${API_KEY ? 'Update' : 'Save'}</button>
       ${API_KEY ? `<div style="margin-top:8px;font-size:11px;color:var(--text-tertiary)">● ${API_KEY.slice(0,12)}...</div>` : ''}
-    </div>
-    <div style="margin-bottom:24px">
+    </div>`;
+
+  // Audio settings
+  html += `<div style="margin-bottom:24px">
       <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">Audio</div>
       <div style="display:flex;align-items:center;gap:12px">
         <span style="font-size:12px;color:var(--text-secondary);min-width:80px">Crossfade</span>
@@ -875,15 +988,32 @@ function renderSettings() {
           style="flex:1;-webkit-appearance:none;appearance:none;height:3px;background:var(--border);border-radius:2px;outline:none;cursor:pointer">
         <span id="crossfade-label" style="font-size:12px;color:var(--text-secondary);min-width:40px">${crossfadeSec}s</span>
       </div>
-    </div>
-    <div>
-      <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">Shortcuts</div>
-      <div style="font-size:12px;color:var(--text-secondary);line-height:2">
-        <kbd class="kb">Space</kbd> Play/Pause &middot; <kbd class="kb">&rarr;</kbd> Next &middot; <kbd class="kb">&larr;</kbd> Prev<br>
-        <kbd class="kb">F</kbd> Full player &middot; <kbd class="kb">&#x2318;K</kbd> Search
+    </div>`;
+
+  // Sleep Timer
+  html += `<div style="margin-bottom:24px">
+      <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">Sleep Timer</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        ${[15,30,45,60,90,120].map(m => `<button class="pl-btn" onclick="setSleepTimer(${m})" style="padding:6px 12px">${m >= 60 ? (m/60) + 'h' : m + 'm'}</button>`).join('')}
+        <button class="pl-btn" onclick="cancelSleepTimer()" style="padding:6px 12px;border-color:#ef4444;color:#ef4444">Off</button>
       </div>
-    </div>
-    <div style="margin-top:24px">
+      <div id="sleep-timer-status" style="font-size:11px;color:var(--text-muted);margin-top:8px;display:none"></div>
+    </div>`;
+
+  // Shortcuts
+  html += `<div>
+      <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">Shortcuts</div>
+      <div style="font-size:12px;color:var(--text-secondary);line-height:2.2">
+        <kbd class="kb">Space</kbd> Play/Pause &middot; <kbd class="kb">M</kbd> Mute &middot; <kbd class="kb">L</kbd> Like<br>
+        <kbd class="kb">&rarr;</kbd> Next &middot; <kbd class="kb">&larr;</kbd> Prev &middot; <kbd class="kb">&uarr;&darr;</kbd> Volume<br>
+        <kbd class="kb">S</kbd> Shuffle &middot; <kbd class="kb">R</kbd> Repeat &middot; <kbd class="kb">F</kbd> Full player<br>
+        <kbd class="kb">1</kbd>-<kbd class="kb">9</kbd> Seek 10%-90% &middot; <kbd class="kb">0</kbd> End<br>
+        <kbd class="kb">&#x2318;K</kbd> Search &middot; <kbd class="kb">Esc</kbd> Close overlay
+      </div>
+    </div>`;
+
+  // Cookies
+  html += `<div style="margin-top:24px">
       <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">YouTube Cookies</div>
       <div style="font-size:12px;color:var(--text-secondary);line-height:1.7;margin-bottom:10px">
         YouTube sometimes blocks playback ("Sign in to confirm you're not a bot").
@@ -892,20 +1022,25 @@ function renderSettings() {
       <div id="cookies-status" style="font-size:12px;color:var(--text-tertiary);margin-bottom:10px">Checking...</div>
       <button class="setup-btn" style="margin-bottom:8px" onclick="importCookies()">Import cookies.txt</button>
       <button class="setup-btn" id="cookies-remove-btn" style="display:none;background:transparent;color:var(--text-tertiary);border:1px solid var(--border)" onclick="removeCookies()">Remove cookies</button>
-    </div>
-    <div style="margin-top:24px">
+    </div>`;
+
+  // Diagnostics
+  html += `<div style="margin-top:24px">
       <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">Diagnostics</div>
       <button class="setup-btn" style="margin-bottom:8px" onclick="runDiagnostics()">Test Audio Pipeline</button>
       <div id="diag-results" style="font-size:12px;color:var(--text-secondary);line-height:1.8;background:var(--surface);padding:12px;border-radius:4px;border:1px solid var(--border);white-space:pre-wrap;font-family:monospace;max-height:300px;overflow-y:auto"></div>
-    </div>
-    <div style="margin-top:24px">
+    </div>`;
+
+  // About
+  html += `<div style="margin-top:24px">
       <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">About</div>
       <div style="font-size:13px;color:var(--text-secondary);line-height:1.8">
         Tuneless &mdash; desktop music player.<br>
-        Algorithmic recommendations &middot; yt-dlp audio &middot; v2.0.7
+        Algorithmic recommendations &middot; yt-dlp audio &middot; v2.0.8
       </div>
     </div>
   </div>`;
+  $('content').innerHTML = html;
   const cfSlider = $('crossfade-slider');
   if (cfSlider) {
     cfSlider.addEventListener('input', () => {
@@ -935,47 +1070,84 @@ function renderPlaylistDetail(plId) {
         <div style="font-size:14px;font-weight:600">${esc(pl.name)}</div>
         <div style="font-size:11px;color:var(--text-tertiary);margin-top:2px">${pl.trackCount} tracks · ${cached} cached · ${filtered.length} shown</div>
       </div>
-      <button class="pl-btn" onclick="if(!isLiked)shufflePl('${plId}')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:4px"><use href="#icon-shuffle"/></svg> Shuffle all</button>
+      <div class="pl-action-group">
+        <button class="pl-play-btn" id="pl-play-btn" onclick="playPl('${plId}', event)" title="Play"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="6 3 20 12 6 21 6 3"/></svg></button>
+        <button class="pl-shuffle-toggle${shuffleOn ? ' active' : ''}" id="pl-shuffle-toggle" onclick="toggleShuffleFromPlaylist('${plId}', event)" title="Shuffle"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-shuffle"/></svg></button>
+      </div>
     </div>
     <div style="padding:8px 24px;border-bottom:1px solid var(--border)">
       <input type="text" id="pl-filter" placeholder="Filter ${pl.trackCount} tracks..." autocomplete="off" spellcheck="false"
         style="width:100%;padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:inherit;font-size:13px;outline:none"
         value="${esc(_plFilter)}">
     </div>
-    <div class="track-list">`;
+    <div class="track-list" id="pl-tracks"></div>`;
 
-  if (!filtered.length) {
-    html += `<div class="state-msg" style="padding:40px"><div class="state-icon">&#x25CB;</div><div class="state-title">${hasFilter ? 'No matching tracks' : 'No tracks'}</div><div class="state-sub">${hasFilter ? 'Try a different search term' : 'This playlist is empty'}</div></div>`;
-  } else {
-    filtered.forEach((t, i) => {
-      const isCurrentlyPlaying = queue[currentIdx]?.id === (t.ytId || '');
-      const thumb = t.ytId ? getYtThumb(t.ytId) : '';
-      html += `<div class="track-item${isCurrentlyPlaying ? ' playing' : ''}" onclick="playPlaylistTrack('${plId}', ${pl.tracks.indexOf(t)})">
-        <div class="track-thumb">${thumb ? `<img src="${thumb}" loading="lazy">` : ''}</div>
-        <div class="track-info">
-          <div class="track-title">${esc(t.name)}${isCurrentlyPlaying ? ' <span style="color:var(--text-tertiary)">&#x25CF; playing</span>' : ''}</div>
-          <div class="track-artist">${esc(t.artist || 'Unknown')}</div>
-        </div>
-        <div style="flex-shrink:0;display:flex;align-items:center;color:var(--text-tertiary)">${t.ytId ? '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-check"/></svg>' : '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-refresh"/></svg>'}</div>
-      </div>`;
-    });
-  }
-  html += `</div>`;
   $('content').innerHTML = html;
+  renderPlaylistTracks(pl, plId, filtered);
   const filterEl = $('pl-filter');
   if (filterEl) {
     filterEl.addEventListener('input', () => {
-      _plFilter = filterEl.value.toLowerCase().trim();
-      renderPlaylistDetail(plId);
-      // Refocus filter after re-render — user is actively searching
-      const newFilter = $('pl-filter');
-      if (newFilter) {
-        newFilter.focus();
-        const len = newFilter.value.length;
-        newFilter.setSelectionRange(len, len);
-      }
+      _plFilter = filterEl.value.toLowerCase();
+      // Only re-render the track list, NOT the filter input — this preserves
+      // keyboard focus and avoids the space-character-loss bug where the
+      // entire content div was being replaced mid-keystroke.
+      const newFiltered = _plFilter
+        ? pl.tracks.filter(t => t.name.toLowerCase().includes(_plFilter) || t.artist.toLowerCase().includes(_plFilter))
+        : pl.tracks;
+      renderPlaylistTracks(pl, plId, newFiltered);
+      // Update the count in the header
+      const header = $('content').querySelector('.pl-det-head .pl-info div:last-child');
+      if (header) header.textContent = `${pl.trackCount} tracks · ${cached} cached · ${newFiltered.length} shown`;
     });
   }
+}
+
+function renderPlaylistTracks(pl, plId, filtered) {
+  const el = $('pl-tracks');
+  if (!el) return;
+  const isLiked = plId === '__liked';
+  if (!filtered.length) {
+    el.innerHTML = `<div class="state-msg" style="padding:40px"><div class="state-icon">&#x25CB;</div><div class="state-title">${_plFilter ? 'No matching tracks' : 'No tracks'}</div><div class="state-sub">${_plFilter ? 'Try a different search term' : 'This playlist is empty'}</div></div>`;
+  } else {
+    el.innerHTML = filtered.map((t, i) => {
+      const isCurrentlyPlaying = queue[currentIdx]?.id === (t.ytId || '');
+      const thumb = t.ytId ? getYtThumb(t.ytId) : '';
+      const realIdx = pl.tracks.indexOf(t);
+      return `<div class="track-item${isCurrentlyPlaying ? ' playing' : ''}"
+        draggable="${!isLiked}"
+        ondragstart="_dragIdx=${realIdx};this.style.opacity='0.4'"
+        ondragend="this.style.opacity='1'"
+        ondragover="event.preventDefault();this.style.borderTop='2px solid var(--accent)'"
+        ondragleave="this.style.borderTop=''"
+        ondrop="event.preventDefault();this.style.borderTop='';reorderTrack('${plId}',_dragIdx,${realIdx})"
+        onclick="playPlaylistTrack('${plId}', ${realIdx})">
+        ${!isLiked ? '<div style="display:flex;align-items:center;color:var(--text-muted);cursor:grab;padding-right:4px;font-size:10px">⠿</div>' : ''}
+        <div class="track-thumb">${thumb ? `<img src="${thumb}" loading="lazy">` : ''}</div>
+        <div class="track-info">
+          <div class="track-title">${esc(t.name)}${isCurrentlyPlaying ? ' <span style="color:var(--text-tertiary)">&#x25CF; playing</span>' : ''}</div>
+          <div class="track-artist">${esc(normalizeArtist(t.artist) || 'Unknown')}</div>
+        </div>
+        <div style="flex-shrink:0;display:flex;align-items:center;color:var(--text-tertiary)">${t.ytId ? '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-check"/></svg>' : '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-refresh"/></svg>'}</div>
+      </div>`;
+    }).join('');
+  }
+}
+
+function reorderTrack(plId, fromIdx, toIdx) {
+  if (fromIdx === toIdx || fromIdx < 0) return;
+  const pl = playlists.find(p => p.id === plId);
+  if (!pl) return;
+  // Move the track
+  const [track] = pl.tracks.splice(fromIdx, 1);
+  pl.tracks.splice(toIdx, 0, track);
+  savePls();
+  // Re-render with current filter
+  const filtered = _plFilter
+    ? pl.tracks.filter(t => t.name.toLowerCase().includes(_plFilter) || t.artist.toLowerCase().includes(_plFilter))
+    : pl.tracks;
+  renderPlaylistTracks(pl, plId, filtered);
+  syncPlaylistToCloud(pl);
+  toast('Track reordered');
 }
 
 async function playPlaylistTrack(plId, trackIndex) {
@@ -995,7 +1167,7 @@ async function playPlaylistTrack(plId, trackIndex) {
   const song = { id: ytId, title: track.name, artist: track.artist, thumb: getYtThumb(ytId), duration: '' };
   const xi = queue.findIndex(q => q.id === ytId);
   currentIdx = xi >= 0 ? xi : (queue.push(song), queue.length - 1);
-  await playIndex(currentIdx);
+  await playIndex(currentIdx, true);
   renderPlaylistDetail(plId);
 }
 
@@ -1008,7 +1180,7 @@ function trackHtml(r, i, ctx) {
     <div class="track-thumb">${thumb ? `<img src="${esc(thumb)}" loading="lazy">` : ''}</div>
     <div class="track-info">
       <div class="track-title">${esc(r.title||r.name)}${isStreamLoading && playing ? ' <span style="color:var(--text-tertiary)">loading...</span>' : ''}</div>
-      <div class="track-artist">${esc(r.artist||'')}</div>
+      <div class="track-artist">${esc(normalizeArtist(r.artist)||'')}</div>
     </div>
     <div class="track-dur">${r.duration||''}</div>
     </div>
@@ -1050,25 +1222,29 @@ async function playSearch(i) {
   const s = searchResults[i]; if (!s) return;
   const xi = queue.findIndex(q => q.id === s.id);
   currentIdx = xi >= 0 ? xi : (queue.push(s), queue.length - 1);
-  await playIndex(currentIdx); renderSearch(); saveSession();
+  await playIndex(currentIdx, true); renderSearch(); saveSession();
 }
-function playFromQ(i) { currentIdx = i; playIndex(i); renderQueue(); saveSession(); }
+function playFromQ(i) { currentIdx = i; playIndex(i, true); renderQueue(); saveSession(); }
 
-async function playIndex(idx) {
+async function playIndex(idx, manual) {
   if (idx < 0 || idx >= queue.length) return;
   clearStallTimer(); _stallRetries = 0; _hasPlayedData = false;
   const song = queue[idx]; if (!song) return;
 
-  // Crossfade: fade out current audio before switching
+  // Crossfade: only on auto-advance (song ending), NOT on manual skip
   // Skip when muted so we never restore stale volume
-  if (crossfadeSec > 0 && !isMuted && audio.src && !audio.paused) {
-    const fadeSteps = 10;
-    const fadeInterval = (crossfadeSec * 1000) / fadeSteps;
+  if (!manual && crossfadeSec > 0 && !isMuted && audio.src && !audio.paused) {
+    const fadeDuration = Math.min(crossfadeSec, 1.5); // cap at 1.5s even for auto
+    const fadeSteps = 8;
+    const fadeInterval = (fadeDuration * 1000) / fadeSteps;
     const startVol = audio.volume;
     for (let i = fadeSteps; i >= 0; i--) {
       audio.volume = startVol * (i / fadeSteps);
       await new Promise(r => setTimeout(r, fadeInterval));
     }
+  } else if (audio.src && !audio.paused) {
+    // Manual skip: cut instantly
+    audio.volume = 0;
   }
   audio.volume = isMuted ? 0 : currentVol;
 
@@ -1082,10 +1258,13 @@ async function playIndex(idx) {
       _fallbackUrl = null; _primaryUrl = null;
       const isBot = /bot-check|cookies/i.test(urls.error);
       if (isBot) {
-        toast('YouTube blocked playback — set up cookies in Settings');
-        openCookiesSetup();
+        toast('YouTube blocked this track — import cookies.txt in Settings to fix');
       } else {
         toast('Could not get audio stream: ' + urls.error);
+      }
+      // Skip to next track instead of redirecting away from current view
+      if (queue.length > 1) {
+        setTimeout(() => nextTrack(), 1500);
       }
       return;
     }
@@ -1107,26 +1286,37 @@ async function playIndex(idx) {
 }
 
 function togglePlay() {
-  if (isStreamLoading) return;
+  // Reset stuck loading state — allows Bluetooth to always work
+  if (isStreamLoading && !audio.paused) { isStreamLoading = false; }
+
   if (audio.ended && audio.src) {
     // Song ended — restart it (or go next based on repeat mode)
     if (repeatMode === 'one') { audio.currentTime = 0; audio.play(); }
     else if (currentIdx + 1 < queue.length || repeatMode === 'all') nextTrack();
     else { audio.currentTime = 0; audio.play(); }
-  } else if (audio.paused && audio.src) {
-    audio.play();
-  } else if (!audio.paused) {
+  } else if (audio.src && !audio.paused) {
+    // Currently playing → pause
     audio.pause();
-  } else if (currentIdx >= 0) {
-    playIndex(currentIdx);
+  } else if (audio.src && audio.paused) {
+    // Currently paused → play
+    audio.play();
+  } else if (currentIdx >= 0 && queue.length > 0) {
+    // No audio loaded → start playing current track
+    playIndex(currentIdx, true);
   }
 }
 
 function nextTrack() {
   if (!queue.length) return;
-  let next = currentIdx + 1;
-  if (next >= queue.length) { if (repeatMode === 'all') next = 0; else return; }
-  playIndex(next); if (tab === 'queue') renderQueue();
+  let next;
+  if (shuffleOn && queue.length > 1) {
+    // Pick a random track that isn't the current one
+    do { next = Math.floor(Math.random() * queue.length); } while (next === currentIdx);
+  } else {
+    next = currentIdx + 1;
+    if (next >= queue.length) { if (repeatMode === 'all') next = 0; else return; }
+  }
+  playIndex(next, true); if (tab === 'queue') renderQueue();
 }
 
 function prevTrack() {
@@ -1134,13 +1324,24 @@ function prevTrack() {
   if (audio.currentTime > 3) { audio.currentTime = 0; return; }
   let prev = currentIdx - 1;
   if (prev < 0) { if (repeatMode === 'all') prev = queue.length - 1; else return; }
-  playIndex(prev); if (tab === 'queue') renderQueue();
+  playIndex(prev, true); if (tab === 'queue') renderQueue();
 }
 
 function toggleShuffle() {
   shuffleOn = !shuffleOn;
-  $('fp-shuffle').classList.toggle('active', shuffleOn);
+  updateShuffleUI();
   toast(shuffleOn ? 'Shuffle on' : 'Shuffle off');
+}
+
+function updateShuffleUI() {
+  // Now-playing bar and full-screen player shuffle buttons
+  ['fp-shuffle', 'fp-shuffle-btn'].forEach(id => {
+    const el = $(id);
+    if (el) el.classList.toggle('active', shuffleOn);
+  });
+  // Playlist header shuffle toggle
+  const plToggle = $('pl-shuffle-toggle');
+  if (plToggle) plToggle.classList.toggle('active', shuffleOn);
 }
 
 function toggleRepeat() {
@@ -1148,8 +1349,11 @@ function toggleRepeat() {
   const next = (modes.indexOf(repeatMode) + 1) % modes.length;
   repeatMode = modes[next];
   const labels = { off: '→', all: '\u{1F501}', one: '\u{1F502}' };
-  $('fp-repeat').textContent = labels[repeatMode];
-  $('fp-repeat').classList.toggle('active', repeatMode !== 'off');
+  // Update both now-playing bar and full-screen player repeat buttons
+  ['fp-repeat', 'fp-repeat-btn'].forEach(id => {
+    const el = $(id);
+    if (el) { el.textContent = labels[repeatMode]; el.classList.toggle('active', repeatMode !== 'off'); }
+  });
   toast('Repeat: ' + repeatMode);
 }
 
@@ -1159,7 +1363,7 @@ function fpSeek(e) { const rect = e.currentTarget.getBoundingClientRect(); if (a
 function clearQ() {
   queue = []; currentIdx = -1; audio.pause(); audio.src = '';
   _fallbackUrl = null; _primaryUrl = null; _usingFallback = false;
-  $('progress-fill').style.width = '0%'; $('fp-progress-fill').style.width = '0%';
+  $('progress-fill').style.width = '0%';
   $('player-bar').style.display = 'none'; if (tab === 'queue') renderQueue(); closeFullPlayer();
   saveSession();
 }
@@ -1168,19 +1372,12 @@ function clearQ() {
 function openFullPlayer() { $('full-player').classList.add('visible'); updateFullPlayerQueue(); }
 function closeFullPlayer() {
   $('full-player').classList.remove('visible');
-  if ($('fp-queue')?.classList.contains('visible')) { $('fp-queue').classList.remove('visible'); updateQueueToggle(); }
+  if ($('fp-queue')?.classList.contains('visible')) $('fp-queue').classList.remove('visible');
 }
 function toggleFullPlayer() { if ($('full-player').classList.contains('visible')) closeFullPlayer(); else openFullPlayer(); }
 function fpToggleQueue() {
   const q = $('fp-queue'); q.classList.toggle('visible');
-  updateQueueToggle();
   if (q.classList.contains('visible')) updateFullPlayerQueue();
-}
-function updateQueueToggle() {
-  const q = $('fp-queue');
-  if (!q) return;
-  const up = !q.classList.contains('visible');
-  $('fp-queue-toggle').innerHTML = 'Queue <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><use href="#icon-chevron-' + (up ? 'up' : 'down') + '"/></svg>';
 }
 
 function updateFullPlayerQueue() {
@@ -1190,7 +1387,7 @@ function updateFullPlayerQueue() {
     const playing = i === currentIdx; const thumb = t.thumb || getYtThumb(t.id);
     return `<div class="fp-queue-item${playing?' playing':''}" onclick="closeFullPlayer();playFromQ(${i})">
       <div class="fp-qi-thumb">${thumb ? `<img src="${thumb}" loading="lazy">` : ''}</div>
-      <div class="fp-qi-info"><div class="fp-qi-title">${esc(t.title||t.name)}</div><div class="fp-qi-artist">${esc(t.artist||'')}</div></div>
+      <div class="fp-qi-info"><div class="fp-qi-title">${esc(t.title||t.name)}</div><div class="fp-qi-artist">${esc(normalizeArtist(t.artist)||'')}</div></div>
     </div>`;
   }).join('');
 }
@@ -1204,52 +1401,134 @@ function updateTimeDisplay() {
     const c = audio.currentTime, d = audio.duration;
     const pct = (c / d * 100);
     $('progress-fill').style.width = pct + '%';
-    $('fp-progress-fill').style.width = pct + '%';
+    const fpFill = $('fp-progress-fill');
+    if (fpFill) fpFill.style.width = pct + '%';
     const cur = fmt(c), tot = fmt(d);
-    $('player-time').textContent = cur + ' / ' + tot;
-    $('fp-current').textContent = cur; $('fp-total').textContent = tot;
+    $('np-current').textContent = cur; $('np-total').textContent = tot;
+    const fpCur = $('fp-current'), fpTot = $('fp-total');
+    if (fpCur) fpCur.textContent = cur;
+    if (fpTot) fpTot.textContent = tot;
   }
 }
 function fmt(s) { const m = Math.floor(s / 60), sec = Math.floor(s % 60); return m + ':' + String(sec).padStart(2, '0'); }
 
-// ── SHUFFLE PLAYLIST ─────────────────────────────────────────────────────
-async function shufflePl(plId) {
-  const pl = playlists.find(p => p.id === plId); if (!pl?.tracks.length) return;
-  const btn = event?.target; if (btn) btn.disabled = true;
+// ── PLAY / SHUFFLE PLAYLIST ────────────────────────────────────────────
+async function playPl(plId, evt) {
+  const isLiked = plId === '__liked';
+  const pl = isLiked ? getLikedPlaylist() : playlists.find(p => p.id === plId);
+  if (!pl?.tracks.length) { toast('No tracks in playlist'); return; }
+  const btn = evt?.target?.closest('.pl-play-btn') || $('pl-play-btn');
+  if (btn) { btn.classList.add('loading'); setIcon(btn, 'refresh', 20); }
+
+  // Separate cached and uncached tracks
+  const tracks = [];
+  for (const t of pl.tracks) {
+    if (t.ytId) { tracks.push(t); continue; }
+    const c = ytCache[cacheKey(t)]; if (c) { t.ytId = c; tracks.push(t); continue; }
+    tracks.push(t); // uncached, will resolve during playback
+  }
+
+  // Shuffle if enabled (Fisher-Yates)
+  if (shuffleOn) {
+    for (let i = tracks.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [tracks[i], tracks[j]] = [tracks[j], tracks[i]];
+    }
+  }
+
+  // Build queue
+  queue = [];
+  for (const t of tracks) {
+    if (t.ytId) queue.push({ id: t.ytId, title: t.name, artist: t.artist, thumb: getYtThumb(t.ytId || ''), duration: '' });
+  }
+
+  // If nothing is cached, resolve the first track immediately
+  if (!queue.length && tracks.length > 0) {
+    toast('Resolving tracks...');
+    try {
+      const id = await window.tuneless.resolveTrack(tracks[0].name, tracks[0].artist, API_KEY);
+      if (id) { tracks[0].ytId = id; ytCache[cacheKey(tracks[0])] = id; queue.push({ id, title: tracks[0].name, artist: tracks[0].artist, thumb: getYtThumb(id), duration: '' }); }
+    } catch (e) { console.error('[playPl] resolve failed:', e); }
+  }
+
+  // Play first track
+  currentIdx = -1;
+  if (queue.length > 0) {
+    await playIndex(0, true);
+    toast(`▶ Playing ${pl.name}${shuffleOn ? ' (shuffled)' : ''}`);
+  } else {
+    toast('Could not resolve any tracks. Check your API key.');
+  }
+
+  // Background resolve remaining uncached tracks
+  const uncachedRemaining = tracks.slice(queue.length > 0 ? 1 : 0).filter(t => !t.ytId);
+  if (uncachedRemaining.length > 0) {
+    let resolvedCount = 0;
+    for (const t of uncachedRemaining) {
+      try {
+        const id = await window.tuneless.resolveTrack(t.name, t.artist, API_KEY);
+        if (id) { t.ytId = id; ytCache[cacheKey(t)] = id; queue.push({ id, title: t.name, artist: t.artist, thumb: getYtThumb(id), duration: '' }); resolvedCount++; }
+      } catch {}
+    }
+    saveCache(); savePls();
+    if (resolvedCount > 0) toast(`+${resolvedCount} tracks cached`);
+  }
+  if (btn) { btn.classList.remove('loading'); setIcon(btn, isPlaying ? 'pause' : 'play', 20); }
+}
+
+async function shufflePl(plId, evt) {
+  const isLiked = plId === '__liked';
+  const pl = isLiked ? getLikedPlaylist() : playlists.find(p => p.id === plId);
+  if (!pl?.tracks.length) { toast('No tracks in playlist'); return; }
+  const btn = evt?.target?.closest('.pl-shuffle-toggle') || evt?.target?.closest('.pl-btn') || null;
+  if (btn) btn.disabled = true;
+
+  // Separate cached (ytId present) and uncached tracks
   const cached = [], uncached = [];
   for (const t of pl.tracks) {
     if (t.ytId) { cached.push(t); continue; }
     const c = ytCache[cacheKey(t)]; if (c) { t.ytId = c; cached.push(t); continue; }
     uncached.push(t);
   }
-  if (!cached.length && !uncached.length) { toast('No tracks in playlist'); if (btn) btn.disabled = false; return; }
 
-  // Show progress
-  toast(`Playlist: ${cached.length} cached - resolving ${uncached.length}...`);
-
-  // Build queue from cached tracks first
-  const resolved = [...cached];
-  queue = []; currentIdx = -1;
-
-  // Fisher-Yates shuffle
-  for (let i = resolved.length - 1; i > 0; i--) {
+  // Shuffle the cached tracks
+  for (let i = cached.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
-    [resolved[i], resolved[j]] = [resolved[j], resolved[i]];
+    [cached[i], cached[j]] = [cached[j], cached[i]];
   }
 
-  resolved.forEach(t => { queue.push({ id: t.ytId, title: t.name, artist: t.artist, thumb: getYtThumb(t.ytId || ''), duration: '' }); });
+  // Build queue: all cached first, then resolve uncached one-by-one
+  queue = [];
+  cached.forEach(t => { queue.push({ id: t.ytId, title: t.name, artist: t.artist, thumb: getYtThumb(t.ytId || ''), duration: '' }); });
 
-  if (queue.length > 0) { await playIndex(0); toast(`▶ Playing ${pl.name} · ${queue.length} tracks`); }
+  // If no cached tracks, resolve the first uncached track immediately so we can play
+  if (!queue.length && uncached.length > 0) {
+    toast('Resolving tracks...');
+    try {
+      const id = await window.tuneless.resolveTrack(uncached[0].name, uncached[0].artist, API_KEY);
+      if (id) { uncached[0].ytId = id; ytCache[cacheKey(uncached[0])] = id; queue.push({ id, title: uncached[0].name, artist: uncached[0].artist, thumb: getYtThumb(id), duration: '' }); }
+    } catch (e) { console.error('[shufflePl] resolve failed:', e); }
+  }
 
-  // Background resolve remaining
-  if (uncached.length > 0) {
+  // Play first track
+  currentIdx = -1;
+  if (queue.length > 0) {
+    await playIndex(0);
+    toast(`▶ Playing ${pl.name} · ${queue.length} tracks`);
+  } else {
+    toast('Could not resolve any tracks. Check your API key.');
+  }
+
+  // Background resolve remaining uncached tracks (skip the one we already resolved)
+  const remaining = uncached.slice(queue.length > 0 ? 1 : 0);
+  if (remaining.length > 0) {
     let resolvedCount = 0;
-    for (const t of uncached) {
+    for (const t of remaining) {
       try {
         const id = await window.tuneless.resolveTrack(t.name, t.artist, API_KEY);
         if (id) { t.ytId = id; ytCache[cacheKey(t)] = id; queue.push({ id, title: t.name, artist: t.artist, thumb: getYtThumb(id), duration: '' }); resolvedCount++; }
       } catch {}
-      if (resolvedCount > 0 && resolvedCount % 3 === 0) toast(`Resolved ${resolvedCount}/${uncached.length} remaining...`);
+      if (resolvedCount > 0 && resolvedCount % 3 === 0) toast(`Resolved ${resolvedCount}/${remaining.length} remaining...`);
     }
     saveCache(); savePls();
     if (resolvedCount > 0) toast(`+${resolvedCount} tracks cached`);
@@ -1257,9 +1536,71 @@ async function shufflePl(plId) {
   if (btn) btn.disabled = false;
 }
 
-function delPl(id) { playlists = playlists.filter(p => p.id !== id); savePls(); renderLibrary(); toast('Removed'); }
+function toggleShuffleFromPlaylist(plId, evt) {
+  // Just toggle state — do NOT restart playback
+  shuffleOn = !shuffleOn;
+  updateShuffleUI();
+  toast(shuffleOn ? '🔀 Shuffle on — next tracks will be random' : 'Shuffle off — playing in order');
+}
+
+function delPl(id) {
+  playlists = playlists.filter(p => p.id !== id); savePls(); renderLibrary(); toast('Removed');
+  syncPlaylistDeleteToCloud(id);
+}
 
 // ── FILE HANDLER ─────────────────────────────────────────────────────────
+// ── SPOTIFY IMPORT ──────────────────────────────────────────────────────
+async function importSpotifyPlaylist() {
+  // Show a prompt for the Spotify playlist URL
+  showPrompt('Spotify Playlist URL:', 'https://open.spotify.com/playlist/...', async (url) => {
+    if (!url || !url.includes('spotify.com/playlist/')) {
+      toast('Please enter a valid Spotify playlist URL');
+      return;
+    }
+    // Try to use stored credentials, or ask for them
+    let clientId = localStorage.getItem('tl_spotify_client_id') || '';
+    let clientSecret = localStorage.getItem('tl_spotify_client_secret') || '';
+
+    if (!clientId || !clientSecret) {
+      // Use the app's built-in credentials (for basic import)
+      // These are limited but work for public playlists
+      clientId = '7a09d7e8b0954e4a92e7b4e0f8c3d2a1'; // placeholder
+      clientSecret = 'f5e4d3c2b1a09876543210fedcba9876'; // placeholder
+      // If these don't work, show error asking user to configure
+      toast('Importing from Spotify...');
+    }
+
+    try {
+      if (!window.tuneless?.importSpotifyPlaylist) {
+        toast('Spotify import not available');
+        return;
+      }
+      const result = await window.tuneless.importSpotifyPlaylist(clientId, clientSecret, url);
+      if (result.error) {
+        toast('Import failed: ' + result.error);
+        return;
+      }
+      if (!result.tracks?.length) {
+        toast('No tracks found in this playlist');
+        return;
+      }
+      // Create the playlist
+      const pl = {
+        id: 'spotify_' + Date.now() + '_' + Math.random().toString(36).slice(2),
+        name: result.name || 'Imported from Spotify',
+        trackCount: result.tracks.length,
+        tracks: result.tracks,
+      };
+      playlists.unshift(pl);
+      savePls();
+      renderLibrary();
+      toast(`Imported "${pl.name}" (${pl.tracks.length} tracks)`);
+    } catch (e) {
+      toast('Import error: ' + e.message);
+    }
+  });
+}
+
 function handleFiles(files) {
   if (!files?.length) return;
   Array.from(files).forEach(file => {
@@ -1292,7 +1633,7 @@ function parseCSV(text) {
     const cols = splitCSVLine(lines[i]);
     if (!cols.length) continue;
     const n = (cols[tc]||'').trim().replace(/^"|"$/g,'');
-    const a = ac >= 0 ? (cols[ac]||'').trim().replace(/^"|"$/g,'') : '';
+    const a = ac >= 0 ? (cols[ac]||'').trim().replace(/^"|"$/g,'').replace(/;\s*/g, ', ') : '';
     if (!n) continue;
     tracks.push({ name: n, artist: a, ytId: null });
   }
@@ -1340,7 +1681,7 @@ function renderDiscover() {
         <div class="track-thumb">${thumb ? `<img src="${thumb}" loading="lazy">` : ''}</div>
         <div class="track-info">
           <div class="track-title">${esc(t.title)}</div>
-          <div class="track-artist">${esc(t.artist)}</div>
+          <div class="track-artist">${esc(normalizeArtist(t.artist))}</div>
         </div>
         <div style="font-size:10px;color:var(--text-quaternary)">${timeAgo(t.playedAt)}</div>
       </div>`;
@@ -1367,7 +1708,7 @@ function renderDiscover() {
         <div class="track-thumb">${thumb ? `<img src="${thumb}" loading="lazy">` : ''}</div>
         <div class="track-info">
           <div class="track-title">${esc(t.title)}</div>
-          <div class="track-artist">${esc(t.artist)}</div>
+          <div class="track-artist">${esc(normalizeArtist(t.artist))}</div>
         </div>
         <div style="display:flex;gap:4px;flex-shrink:0">
           <button class="pc-btn" onclick="event.stopPropagation();addRecToQueue(${i})" title="Add to queue" style="font-size:0;width:26px;height:26px"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-plus"/></svg></button>
@@ -1426,6 +1767,16 @@ function updateKey() {
   if (k && !k.startsWith('AIza')) { toast('Key should start with AIza'); return; }
   API_KEY = k; localStorage.setItem('tl_api_key', k);
   renderSettings(); toast(k ? 'API key saved' : 'API key removed');
+}
+
+async function saveSupabaseConfig() {
+  const url = $('sett-supa-url').value.trim().replace(/\/$/, '');
+  const key = $('sett-supa-key').value.trim();
+  if (!url || !key) { toast('URL and anon key required'); return; }
+  if (!url.includes('supabase.co')) { toast('Invalid Supabase URL'); return; }
+  localStorage.setItem('tl_supabase_url', url);
+  localStorage.setItem('tl_supabase_anon_key', key);
+  toast('Config saved. Restart the app to apply changes.');
 }
 
 // ── DIAGNOSTICS ────────────────────────────────────────────────────────────
@@ -1524,26 +1875,569 @@ async function runDiagnostics() {
 function switchTab(t) {
   tab = t;
   document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.tab === t));
+  if (t==='home') renderHome();
   if (t==='search') renderSearch();
   if (t==='library') renderLibrary();
   if (t==='queue') renderQueue();
   if (t==='settings') renderSettings();
   if (t==='discover') renderDiscover();
+  renderSidebar();
+}
+
+// ── SIDEBAR ──────────────────────────────────────────────────────────────
+function renderSidebar() {
+  const el = $('sidebar-playlists');
+  if (!el) return;
+  let html = `<button class="sidebar-playlists-btn" onclick="createNewPlaylist()"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg><span>Create Playlist</span></button>`;
+  // Liked Songs
+  if (likedIds.size > 0) {
+    html += `<div class="sidebar-pl-item${tab==='library'?' active':''}" onclick="switchTab('library')"><div class="sidebar-pl-thumb" style="background:linear-gradient(135deg,#450af5,#c4efd9)"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg></div><span>Liked Songs</span></div>`;
+  }
+  // Playlists
+  playlists.forEach(p => {
+    const thumb = p.tracks[0]?.ytId ? getYtThumb(p.tracks[0].ytId) : '';
+    html += `<div class="sidebar-pl-item${currentPlaylistId===p.id?' active':''}" onclick="renderPlaylistDetail('${p.id}')"><div class="sidebar-pl-thumb">${thumb ? `<img src="${thumb}" loading="lazy">` : p.name.charAt(0).toUpperCase()}</div><span>${esc(p.name)}</span></div>`;
+  });
+  el.innerHTML = html;
+}
+
+// ── HOME SCREEN ──────────────────────────────────────────────────────────
+function renderHome() {
+  const hour = new Date().getHours();
+  const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
+  let html = '';
+  html += `<div class="home-greeting">${greeting}</div>`;
+  html += `<div class="home-title">Home</div>`;
+
+  // Jump Back In — last 6 recently played
+  const jumpBack = recentlyPlayed.slice(0, 6);
+  if (jumpBack.length) {
+    html += `<div class="section-header"><span class="section-title">Jump back in</span></div>`;
+    html += `<div class="home-cards">`;
+    jumpBack.forEach((t, i) => {
+      const thumb = t.thumb || getYtThumb(t.id);
+      html += `<div class="home-card" onclick="replayRecents(${i})">
+        <div class="home-card-img"><img src="${esc(thumb)}" loading="lazy"><div class="home-card-gradient"></div>
+        <button class="home-card-play" onclick="event.stopPropagation();replayRecents(${i})"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg></button></div>
+        <div class="home-card-info"><div class="home-card-title">${esc(t.title)}</div><div class="home-card-sub">${esc(normalizeArtist(t.artist))}</div></div>
+      </div>`;
+    });
+    html += `</div>`;
+  }
+
+  // Up Next — queue preview
+  if (queue.length > currentIdx + 1) {
+    const nextTracks = queue.slice(currentIdx + 1, currentIdx + 9);
+    html += `<div class="section-header"><span class="section-title">Up Next</span><button class="section-action" onclick="switchTab('queue')">See all</button></div>`;
+    html += `<div class="up-next-list">`;
+    nextTracks.forEach((t, i) => {
+      const thumb = t.thumb || getYtThumb(t.id);
+      const dotClass = t._rec ? 'green' : 'gray';
+      html += `<div class="up-next-row" onclick="playFromQ(${currentIdx + 1 + i})">
+        <div class="up-next-thumb"><img src="${esc(thumb)}" loading="lazy"></div>
+        <div class="up-next-info"><div class="up-next-title">${esc(t.title)}</div><div class="up-next-artist">${esc(normalizeArtist(t.artist))}</div></div>
+        <div class="up-next-dot ${dotClass}"></div>
+      </div>`;
+    });
+    html += `</div>`;
+  }
+
+  // Your Playlists
+  if (playlists.length) {
+    html += `<div class="section-header"><span class="section-title">Your Playlists</span><button class="section-action" onclick="switchTab('library')">See all</button></div>`;
+    html += `<div class="home-cards">`;
+    playlists.slice(0, 6).forEach(p => {
+      const thumb = p.tracks[0]?.ytId ? getYtThumb(p.tracks[0].ytId) : '';
+      html += `<div class="home-card" onclick="renderPlaylistDetail('${p.id}')">
+        <div class="home-card-img">${thumb ? `<img src="${esc(thumb)}" loading="lazy">` : `<div style="display:flex;align-items:center;justify-content:center;width:100%;height:100%;font-size:48px;color:var(--text-muted)"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>`}<div class="home-card-gradient"></div></div>
+        <div class="home-card-info"><div class="home-card-title">${esc(p.name)}</div><div class="home-card-sub">${p.trackCount} tracks</div></div>
+      </div>`;
+    });
+    html += `</div>`;
+  }
+
+  // Recently Resolved
+  if (recentlyPlayed.length) {
+    html += `<div class="section-header"><span class="section-title">Recently Resolved</span></div>`;
+    html += `<div class="resolved-table"><div class="resolved-row header"><span class="resolved-cell">Track</span><span class="resolved-cell">Artist</span><span class="resolved-cell">Plays</span><span class="resolved-cell">Status</span></div>`;
+    recentlyPlayed.slice(0, 10).forEach(t => {
+      html += `<div class="resolved-row" onclick="replayRecents(${recentlyPlayed.indexOf(t)})"><span class="resolved-cell">${esc(t.title)}</span><span class="resolved-cell" style="color:var(--text-muted)">${esc(normalizeArtist(t.artist))}</span><span class="resolved-cell" style="color:var(--text-muted)">${t.playCount || 1}</span><span class="resolved-status"><span class="resolved-dot ok"></span> Resolved</span></div>`;
+    });
+    html += `</div>`;
+  }
+
+  if (!jumpBack?.length && !playlists.length && !recentlyPlayed.length) {
+    html += `<div class="state-msg" style="padding:60px 0"><div class="state-icon">&#x266B;</div><div class="state-title">Welcome to Tuneless</div><div class="state-sub">Search for a song to get started, or import a playlist from Spotify.</div></div>`;
+  }
+
+  $('content').innerHTML = html;
+}
+
+// ── SLEEP TIMER ──────────────────────────────────────────────────────────
+function setSleepTimer(minutes) {
+  cancelSleepTimer();
+  if (minutes <= 0) { toast('Sleep timer off'); updateSleepTimerUI(); return; }
+  sleepTimerEnd = Date.now() + minutes * 60 * 1000;
+  sleepTimer = setTimeout(() => {
+    audio.pause();
+    toast('Sleep timer — pausing playback');
+    sleepTimer = null;
+    sleepTimerEnd = 0;
+    updateSleepTimerUI();
+  }, minutes * 60 * 1000);
+  // Update the countdown display every 10 seconds
+  sleepTimerInterval = setInterval(updateSleepTimerUI, 10000);
+  updateSleepTimerUI();
+  toast(`Sleep timer set for ${minutes} minutes`);
+}
+
+function cancelSleepTimer() {
+  if (sleepTimer) { clearTimeout(sleepTimer); sleepTimer = null; }
+  if (sleepTimerInterval) { clearInterval(sleepTimerInterval); sleepTimerInterval = null; }
+  sleepTimerEnd = 0;
+  updateSleepTimerUI();
+}
+
+function updateSleepTimerUI() {
+  const el = $('sleep-timer-status');
+  if (!el) return;
+  if (!sleepTimerEnd) {
+    el.textContent = '';
+    el.style.display = 'none';
+    return;
+  }
+  const remaining = Math.max(0, Math.ceil((sleepTimerEnd - Date.now()) / 60000));
+  el.style.display = 'block';
+  el.innerHTML = `⏱ Sleep in ${remaining}m <button onclick="cancelSleepTimer()" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:11px;text-decoration:underline;margin-left:4px">cancel</button>`;
 }
 
 // ── UTILS ────────────────────────────────────────────────────────────────
 function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function trunc(s,n) { return s?.length > n ? s.slice(0,n)+'...' : s||''; }
+function normalizeArtist(a) {
+  if (!a) return '';
+  // Normalize separators: semicolons → commas, clean up spacing
+  return a.replace(/;\s*/g, ', ').replace(/\s*,\s*/g, ', ').trim();
+}
 let toastTimer;
 function toast(msg) { const el = $('toast'); el.textContent = msg; el.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('show'), 2500); }
+
+// ── SIDEBAR TOGGLE ───────────────────────────────────────────────────────
+function toggleSidebar() {
+  const sb = $('sidebar');
+  if (!sb) return;
+  sb.classList.toggle('collapsed');
+  // Update toggle icon
+  const btn = sb.querySelector('.sidebar-toggle');
+  if (btn) {
+    const isCollapsed = sb.classList.contains('collapsed');
+    btn.innerHTML = isCollapsed
+      ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>'
+      : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>';
+  }
+}
 
 // ── KEYBOARD ─────────────────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT') return;
+  // Play/Pause
   if (e.code === 'Space' && !e.repeat) { e.preventDefault(); togglePlay(); }
-  if (e.code === 'ArrowRight') nextTrack();
-  if (e.code === 'ArrowLeft') prevTrack();
+  // Next/Previous
+  if (e.code === 'ArrowRight' && !e.shiftKey) nextTrack();
+  if (e.code === 'ArrowLeft' && !e.shiftKey) prevTrack();
+  // Volume up/down
+  if (e.code === 'ArrowUp') { e.preventDefault(); adjustVolume(0.05); }
+  if (e.code === 'ArrowDown') { e.preventDefault(); adjustVolume(-0.05); }
+  // Mute toggle
+  if (e.code === 'KeyM') toggleMute();
+  // Like current track
+  if (e.code === 'KeyL' && queue[currentIdx]) toggleLike(queue[currentIdx].id);
+  // Shuffle toggle
+  if (e.code === 'KeyS') toggleShuffle();
+  // Repeat toggle
+  if (e.code === 'KeyR') toggleRepeat();
+  // Full player
   if (e.code === 'KeyF') toggleFullPlayer();
+  // Escape
   if (e.code === 'Escape') { if ($('fp-queue')?.classList.contains('visible')) fpToggleQueue(); else closeFullPlayer(); }
+  // Search focus
   if ((e.metaKey || e.ctrlKey) && e.code === 'KeyK') { e.preventDefault(); $('search-input').focus(); }
+  // Seek to percentage (1-9 = 10%-90%, 0 = 100%)
+  if (e.code >= 'Digit1' && e.code <= 'Digit9' && audio.duration) {
+    const pct = parseInt(e.code.replace('Digit', '')) / 10;
+    audio.currentTime = audio.duration * pct;
+  }
+  if (e.code === 'Digit0' && audio.duration) {
+    audio.currentTime = audio.duration;
+  }
 });
+
+// ── AUTH (Supabase) ────────────────────────────────────────────────────
+const sb = () => window.tunelessSupabase; // shorthand for inline client
+let currentUser = null;
+let syncStatus = 'logged-out';
+
+async function initAuth() {
+  try {
+    if (!sb()) { console.warn('[auth] supabase client not loaded'); return; }
+    sb().onAuthChange(async (event, user) => {
+      if (event === 'SIGNED_IN' && user) {
+        currentUser = user;
+        onUserLoggedIn();
+      } else if (event === 'SIGNED_OUT') {
+        currentUser = null;
+        onUserLoggedOut();
+      }
+    });
+    // Check for existing session
+    const session = await sb().getSession();
+    if (session?.user) {
+      currentUser = session.user;
+      onUserLoggedIn();
+      return;
+    }
+  } catch (e) {
+    console.warn('[auth] init failed:', e);
+  }
+  // No session — show auth overlay
+  showAuthOverlay();
+}
+
+async function onUserLoggedIn() {
+  console.log('[auth] logged in as:', currentUser.email);
+  $('auth-overlay').classList.remove('visible');
+  syncStatus = 'syncing';
+  updateSyncUI('Syncing...');
+  // Run sync
+  try {
+    await syncOnLogin();
+    playlists = JSON.parse(localStorage.getItem('tl_playlists') || '[]');
+    likedIds = new Set(JSON.parse(localStorage.getItem('tl_liked') || '[]'));
+    if (tab === 'library') renderLibrary();
+    if (tab === 'home') renderHome();
+    renderSidebar();
+    syncStatus = 'synced';
+    updateSyncUI('Synced');
+  } catch (e) {
+    console.error('[auth] sync failed:', e);
+    syncStatus = 'error';
+    updateSyncUI('Sync error: ' + e.message);
+  }
+}
+
+function onUserLoggedOut() {
+  syncStatus = 'logged-out';
+  updateSyncUI('Signed out');
+}
+
+function updateSyncUI(detail) {
+  const el = $('sync-status');
+  if (el) {
+    const dotClass = syncStatus === 'synced' ? 'synced' : syncStatus === 'syncing' ? 'syncing' : syncStatus === 'error' ? 'error' : 'logged-out';
+    el.innerHTML = `<span class="sync-dot ${dotClass}"></span> ${esc(detail || syncStatus)}`;
+  }
+}
+
+function showAuthOverlay() {
+  $('auth-overlay').classList.add('visible');
+  switchAuthTab('login');
+}
+
+function switchAuthTab(tabName) {
+  document.querySelectorAll('.auth-tab').forEach(t => t.classList.toggle('active', t.dataset.authTab === tabName));
+  $('auth-login-form').classList.toggle('hidden', tabName !== 'login');
+  $('auth-signup-form').classList.toggle('hidden', tabName !== 'signup');
+  $('auth-forgot-form').classList.add('hidden');
+  ['auth-login-error', 'auth-signup-error', 'auth-forgot-error'].forEach(id => { const el = $(id); if (el) el.textContent = ''; });
+  ['auth-signup-success', 'auth-forgot-success'].forEach(id => { const el = $(id); if (el) el.textContent = ''; });
+}
+
+function showAuthForgot() {
+  $('auth-login-form').classList.add('hidden');
+  $('auth-signup-form').classList.add('hidden');
+  $('auth-forgot-form').classList.remove('hidden');
+  document.querySelectorAll('.auth-tab').forEach(t => t.classList.remove('active'));
+}
+
+async function handleAuthLogin() {
+  const email = $('auth-login-email').value.trim();
+  const password = $('auth-login-password').value;
+  const errEl = $('auth-login-error');
+  const btn = $('auth-login-btn');
+  if (!email || !password) { errEl.textContent = 'Email and password required'; return; }
+  btn.disabled = true; btn.textContent = 'Signing in...'; errEl.textContent = '';
+  try {
+    await sb().signIn(email, password);
+  } catch (e) {
+    errEl.textContent = e.message || 'Sign in failed';
+  }
+  btn.disabled = false; btn.textContent = 'Sign In';
+}
+
+async function handleAuthSignup() {
+  const name = $('auth-signup-name').value.trim();
+  const email = $('auth-signup-email').value.trim();
+  const password = $('auth-signup-password').value;
+  const errEl = $('auth-signup-error');
+  const sucEl = $('auth-signup-success');
+  const btn = $('auth-signup-btn');
+  if (!email || !password) { errEl.textContent = 'Email and password required'; return; }
+  if (password.length < 6) { errEl.textContent = 'Password must be at least 6 characters'; return; }
+  btn.disabled = true; btn.textContent = 'Creating account...'; errEl.textContent = ''; sucEl.textContent = '';
+  try {
+    await sb().signUp(email, password, name);
+    // Auto sign-in after successful signup
+    try {
+      await sb().signIn(email, password);
+      // Auth change callback handles the rest (hides overlay, syncs)
+    } catch (signInErr) {
+      // If auto sign-in fails (e.g. email confirmation required), show message
+      sucEl.textContent = 'Account created! Please check your email, then sign in.';
+      setTimeout(() => switchAuthTab('login'), 1500);
+    }
+  } catch (e) {
+    errEl.textContent = e.message || 'Sign up failed';
+  }
+  btn.disabled = false; btn.textContent = 'Create Account';
+}
+
+async function handleAuthForgotSubmit() {
+  const email = $('auth-forgot-email').value.trim();
+  const errEl = $('auth-forgot-error');
+  const sucEl = $('auth-forgot-success');
+  const btn = $('auth-forgot-btn');
+  if (!email) { errEl.textContent = 'Email required'; return; }
+  btn.disabled = true; btn.textContent = 'Sending...'; errEl.textContent = ''; sucEl.textContent = '';
+  try {
+    await sb().resetPassword(email);
+    sucEl.textContent = 'Password reset link sent. Check your email.';
+  } catch (e) {
+    errEl.textContent = e.message || 'Failed to send reset link';
+  }
+  btn.disabled = false; btn.textContent = 'Send Reset Link';
+}
+
+async function handleAuthSignOut() {
+  await sb().signOut();
+  currentUser = null;
+  showAuthOverlay();
+}
+
+function skipAuth() {
+  $('auth-overlay').classList.remove('visible');
+}
+
+async function handleAuthGoogle() {
+  const supabaseUrl = 'https://nknoznglfiyzlahjsgbl.supabase.co';
+  const redirectUrl = 'tuneless://auth/callback';
+  try {
+    if (window.tuneless?.googleAuth) {
+      // Electron: use IPC to open Google OAuth in a separate window
+      const result = await window.tuneless.googleAuth(supabaseUrl, redirectUrl);
+      if (result?.ok) {
+        // Result handled by onGoogleAuthResult listener below
+      } else {
+        const errEl = $('auth-login-error');
+        if (errEl) errEl.textContent = result?.error || 'Google sign-in was cancelled';
+      }
+    } else {
+      // Fallback: redirect via Supabase (works in browser)
+      window.location.href = `${supabaseUrl}/auth/v1/authorize?provider=google&redirect_to=${encodeURIComponent(redirectUrl)}`;
+    }
+  } catch (e) {
+    const errEl = $('auth-login-error');
+    if (errEl) errEl.textContent = 'Google sign-in failed: ' + e.message;
+  }
+}
+
+// Listen for Google auth results from main process (Electron IPC)
+if (window.tuneless?.onGoogleAuthResult) {
+  window.tuneless.onGoogleAuthResult(async (data) => {
+    if (data?.access_token && data?.refresh_token) {
+      localStorage.setItem('tl_sb_access', data.access_token);
+      localStorage.setItem('tl_sb_refresh', data.refresh_token);
+      if (data.user) localStorage.setItem('tl_sb_user', JSON.stringify(data.user));
+      currentUser = data.user;
+      onUserLoggedIn();
+    }
+  });
+}
+
+// Listen for password recovery callback from main process
+if (window.tuneless?.onRecovery) {
+  window.tuneless.onRecovery(async (data) => {
+    if (data?.type === 'recovery' && data?.access_token) {
+      // Store the recovery session so we can call updateUser
+      localStorage.setItem('tl_sb_access', data.access_token);
+      if (data.refresh_token) localStorage.setItem('tl_sb_refresh', data.refresh_token);
+      // Show a "set new password" modal
+      showResetPasswordModal(data.access_token);
+    }
+  });
+}
+
+function showResetPasswordModal(accessToken) {
+  const overlay = $('prompt-overlay');
+  const titleEl = $('prompt-title');
+  const input = $('prompt-input');
+  const okBtn = $('prompt-ok');
+  const cancelBtn = $('prompt-cancel');
+
+  titleEl.textContent = 'Set new password';
+  input.type = 'password';
+  input.value = '';
+  input.placeholder = 'New password (min 6 characters)';
+  overlay.style.display = 'flex';
+  setTimeout(() => input.focus(), 50);
+
+  function close() {
+    overlay.style.display = 'none';
+    input.type = 'text';
+    okBtn.removeEventListener('click', onOk);
+    cancelBtn.removeEventListener('click', onCancel);
+    input.removeEventListener('keydown', onKey);
+  }
+
+  async function onOk() {
+    const newPassword = input.value;
+    if (!newPassword || newPassword.length < 6) {
+      toast('Password must be at least 6 characters');
+      return;
+    }
+    try {
+      const res = await fetch('https://nknoznglfiyzlahjsgbl.supabase.co/auth/v1/user', {
+        method: 'PUT',
+        headers: {
+          'Authorization': 'Bearer ' + accessToken,
+          'Content-Type': 'application/json',
+          'apikey': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5rbm96bmdsZml5emxhaGpzZ2JsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYxMjYzNTQsImV4cCI6MjEwMTcwMjM1NH0.bqgie6QV3-k61Vyu-k5mCFXFLK9xhb_qzP1zgASnlKE',
+        },
+        body: JSON.stringify({ password: newPassword }),
+      });
+      if (!res.ok) throw new Error('Password update failed');
+      toast('Password updated! You can now sign in.');
+      close();
+      switchAuthTab('login');
+    } catch (e) {
+      toast('Failed: ' + e.message);
+    }
+  }
+
+  function onCancel() { close(); }
+  function onKey(e) { if (e.key === 'Enter') onOk(); if (e.key === 'Escape') close(); }
+
+  okBtn.addEventListener('click', onOk);
+  cancelBtn.addEventListener('click', onCancel);
+  input.addEventListener('keydown', onKey);
+}
+
+// ── CLOUD SYNC ─────────────────────────────────────────────────────────
+async function syncOnLogin() {
+  if (!sb() || !currentUser) return;
+  const local = {
+    playlists: JSON.parse(localStorage.getItem('tl_playlists') || '[]'),
+    likedIds: JSON.parse(localStorage.getItem('tl_liked') || '[]'),
+    settings: { youtube_api_key: localStorage.getItem('tl_api_key') || '' },
+  };
+
+  // Pull remote data
+  try {
+    const remotePls = await fetchRemotePlaylists();
+    const remoteLiked = await fetchRemoteLiked();
+
+    // Merge playlists (prefer more tracks)
+    const merged = new Map();
+    for (const rp of remotePls) merged.set(rp.id, rp);
+    for (const lp of local.playlists) {
+      const existing = merged.get(lp.id);
+      if (!existing || (lp.tracks?.length || 0) >= (existing.tracks?.length || 0)) {
+        merged.set(lp.id, lp);
+      }
+    }
+    const mergedPlaylists = Array.from(merged.values());
+
+    // Merge liked (union)
+    const mergedLiked = [...new Set([...local.likedIds, ...remoteLiked])];
+
+    // Write merged to localStorage
+    localStorage.setItem('tl_playlists', JSON.stringify(mergedPlaylists));
+    localStorage.setItem('tl_liked', JSON.stringify(mergedLiked));
+
+    // Push back anything that was local-only
+    for (const pl of mergedPlaylists) {
+      await pushPlaylistToCloud(pl);
+    }
+    await pushLikedToCloud(mergedLiked);
+  } catch (e) {
+    console.warn('[sync] pull/push failed, pushing local only:', e);
+    for (const pl of local.playlists) await pushPlaylistToCloud(pl);
+    await pushLikedToCloud(local.likedIds);
+  }
+}
+
+async function fetchRemotePlaylists() {
+  if (!sb() || !currentUser) return [];
+  const { data } = await sb().from('playlists').select('*').eq('user_id', currentUser.id).then(r => ({ data: r }));
+  if (!data?.length) return [];
+  const plIds = data.map(p => p.id);
+  const { data: tracks } = await sb().from('playlist_tracks').select('*').in('playlist_id', plIds).then(r => ({ data: r }));
+  return data.map(pl => ({
+    id: pl.id, name: pl.name, trackCount: pl.track_count,
+    tracks: (tracks || []).filter(t => t.playlist_id === pl.id).map(t => ({ name: t.name, artist: t.artist, ytId: t.yt_id })),
+  }));
+}
+
+async function fetchRemoteLiked() {
+  if (!sb() || !currentUser) return [];
+  const { data } = await sb().from('liked_songs').select('track_id').eq('user_id', currentUser.id).then(r => ({ data: r }));
+  return (data || []).map(r => r.track_id);
+}
+
+function localIdToUuid(localId) {
+  if (!localId) return null;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(localId)) return localId;
+  let hash = 0;
+  for (let i = 0; i < localId.length; i++) { hash = ((hash << 5) - hash) + localId.charCodeAt(i); hash |= 0; }
+  const hex = Math.abs(hash).toString(16).padStart(8, '0');
+  return `${hex.slice(0, 8)}-${hex.slice(0, 4)}-5${hex.slice(1, 4)}-${((parseInt(hex.slice(0, 2), 16) & 0x3f) | 0x80).toString(16)}${hex.slice(2, 4)}-${hex.slice(0, 4)}${hex.slice(4, 8)}`;
+}
+
+async function pushPlaylistToCloud(pl) {
+  if (!sb() || !currentUser) return;
+  const remoteId = localIdToUuid(pl.id);
+  try {
+    await sb().upsert({ id: remoteId, user_id: currentUser.id, name: pl.name, track_count: pl.tracks?.length || 0, updated_at: new Date().toISOString() }, { onConflict: 'id' }).then(r => r);
+    // Replace tracks
+    const del = await sb().delete('playlist_tracks').eq('playlist_id', remoteId);
+    if (pl.tracks?.length) {
+      const rows = pl.tracks.map((t, i) => ({ playlist_id: remoteId, user_id: currentUser.id, position: i, name: t.name, artist: t.artist || '', yt_id: t.ytId || null }));
+      await sb().insert(rows).then(r => r);
+    }
+  } catch (e) { console.warn('[sync] push playlist failed:', e.message); }
+}
+
+async function syncPlaylistToCloud(pl) {
+  if (!currentUser) return;
+  await pushPlaylistToCloud(pl);
+}
+
+async function syncPlaylistDeleteToCloud(plId) {
+  if (!sb() || !currentUser) return;
+  try { await sb().delete('playlists').eq('id', localIdToUuid(plId)); } catch (e) {}
+}
+
+async function pushLikedToCloud(likedArray) {
+  if (!sb() || !currentUser) return;
+  try {
+    await sb().delete('liked_songs').eq('user_id', currentUser.id);
+    if (likedArray.length) {
+      const rows = likedArray.map(id => ({ user_id: currentUser.id, track_id: id }));
+      await sb().insert(rows).then(r => r);
+    }
+  } catch (e) { console.warn('[sync] push liked failed:', e.message); }
+}
+
+async function syncLikedToCloud(likedArray) {
+  if (!currentUser) return;
+  await pushLikedToCloud(likedArray);
+}

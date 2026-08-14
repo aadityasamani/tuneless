@@ -2,6 +2,8 @@ node_modules/
 dist/
 .DS_Store
 *.log
+.env
+.env.local
 
 # Player debug scripts
 *-player-script.js
@@ -18,3 +20,4 @@ build/
 Pods/
 *.xcworkspace
 *.xcuserstate
+supabase/.temp/

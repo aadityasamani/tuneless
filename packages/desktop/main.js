@@ -1,9 +1,12 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, globalShortcut, protocol, net } = require('electron');
 const path = require('path');
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const { spawn, execFile } = require('child_process');
+
+// Register custom protocol BEFORE app is ready
+app.setAsDefaultProtocolClient('tuneless');
 
 const YOUTUBE_API_BASE = 'https://www.googleapis.com/youtube/v3';
 const STREAM_PORT = 18762;
@@ -76,7 +79,7 @@ function startStreamServer() {
     try {
       const formatArg = useFallback
         ? 'bestaudio[acodec!=opus]/bestaudio[ext=m4a]/bestaudio'
-        : 'bestaudio[ext=m4a]/bestaudio[acodec!=opus]/bestaudio';
+        : 'bestaudio[ext=m4a][abr>128]/bestaudio[ext=m4a]/bestaudio[acodec!=opus]/bestaudio';
       const ytdlpArgs = [
         '-f', formatArg,
         '-o', tempPath,
@@ -158,10 +161,18 @@ function createWindow() {
   });
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 
-  // Show window when ready, with a fallback timeout
-  mainWindow.once('ready-to-show', () => mainWindow.show());
-  // Safety timeout — if page doesn't render in 10s, force show anyway
-  setTimeout(() => { if (mainWindow && !mainWindow.isVisible()) { mainWindow.show(); } }, 10000);
+  // Show window only when fully rendered — prevents blank/white flash
+  let shown = false;
+  mainWindow.once('ready-to-show', () => {
+    if (!shown) { shown = true; mainWindow.show(); }
+  });
+  // Fallback: if page doesn't render in 8s, show anyway (stream server may be downloading)
+  setTimeout(() => {
+    if (!shown && mainWindow && !mainWindow.isDestroyed()) {
+      shown = true;
+      mainWindow.show();
+    }
+  }, 8000);
 
   // Log renderer errors to help debug
   mainWindow.webContents.on('console-message', (event, level, message) => {
@@ -174,6 +185,35 @@ function createWindow() {
   mainWindow.webContents.on('crashed', () => {
     console.error('[renderer] crashed');
     mainWindow.show();
+  });
+
+  // Intercept Supabase password recovery / OAuth redirect on main window
+  mainWindow.webContents.on('will-navigate', (e, url) => {
+    const isRecovery = (url.startsWith('http://localhost') || url.startsWith('tuneless://'))
+      && url.includes('access_token=');
+    if (isRecovery) {
+      e.preventDefault();
+      // Extract tokens from the URL fragment and send to renderer
+      try {
+        const parsed = new URL(url);
+        const hash = parsed.hash.substring(1);
+        const params = new URLSearchParams(hash);
+        const accessToken = params.get('access_token');
+        const refreshToken = params.get('refresh_token');
+        const type = params.get('type');
+        if (accessToken) {
+          mainWindow.webContents.send('auth:recovery', {
+            access_token: accessToken,
+            refresh_token: refreshToken,
+            type: type,
+          });
+        }
+      } catch (err) {
+        console.error('[main] failed to parse recovery URL:', err);
+      }
+      // Navigate back to the app
+      mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+    }
   });
 
   // Closing the window quits the app — no hidden background process.
@@ -189,6 +229,11 @@ if (!gotTheLock) {
   app.quit();
 } else {
   app.on('second-instance', (event, commandLine, workingDirectory) => {
+    // Extract deep link URL from command line (Windows sends tuneless:// URLs here)
+    const deepLink = commandLine.find(arg => arg.startsWith('tuneless://'));
+    if (deepLink && mainWindow) {
+      handleDeepLink(deepLink);
+    }
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.show();
@@ -197,18 +242,59 @@ if (!gotTheLock) {
   });
 }
 
+// Handle deep link (custom protocol) URLs
+function handleDeepLink(url) {
+  try {
+    const parsed = new URL(url);
+    const hash = parsed.hash.substring(1);
+    const params = new URLSearchParams(hash);
+    const accessToken = params.get('access_token');
+    const refreshToken = params.get('refresh_token');
+    const type = params.get('type');
+    if (accessToken && mainWindow) {
+      mainWindow.webContents.send('auth:recovery', {
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        type: type,
+      });
+    }
+  } catch (e) {
+    console.error('[deep-link] failed to parse:', url, e);
+  }
+}
+
+// Also handle deep link on macOS/Linux (open-url event)
+app.on('open-url', (event, url) => {
+  event.preventDefault();
+  if (url.startsWith('tuneless://')) {
+    handleDeepLink(url);
+  }
+});
+
+// Disable GPU acceleration to prevent "not responding" after install
+// (GPU cache creation fails on fresh installs causing renderer hang)
+app.commandLine.appendSwitch('disable-gpu');
+app.commandLine.appendSwitch('disable-software-rasterizer');
+
 app.on('ready', () => {
+  // Register global media key shortcuts (for keyboards/headsets that don't use MediaSession)
+  globalShortcut.register('MediaPlayPause', () => { if (mainWindow) mainWindow.webContents.send('media:play-pause'); });
+  globalShortcut.register('MediaNextTrack', () => { if (mainWindow) mainWindow.webContents.send('media:next'); });
+  globalShortcut.register('MediaPreviousTrack', () => { if (mainWindow) mainWindow.webContents.send('media:prev'); });
+  globalShortcut.register('MediaStop', () => { if (mainWindow) mainWindow.webContents.send('media:stop'); });
   try {
     startStreamServer();
   } catch (e) {
     console.error('[startup] stream server failed:', e.message);
   }
-  createWindow();
+  // Delay window creation slightly to let system settle after install
+  setTimeout(() => createWindow(), 500);
 });
 app.on('window-all-closed', () => { app.quit(); });
 app.on('activate', () => { if (mainWindow) mainWindow.show(); });
 app.on('before-quit', () => {
   app.isQuitting = true;
+  globalShortcut.unregisterAll();
   if (streamServer) streamServer.close();
 });
 
@@ -298,6 +384,176 @@ ipcMain.handle('cookies:remove', async () => {
   return { ok: true };
 });
 
+// ── IPC: Google OAuth (Supabase) ───────────────────────────────────────
+ipcMain.handle('auth:google', async (event, { supabaseUrl, redirectUrl }) => {
+  return new Promise((resolve) => {
+    const authWindow = new BrowserWindow({
+      width: 500, height: 700,
+      webPreferences: { nodeIntegration: false, contextIsolation: true },
+      title: 'Sign in with Google',
+      parent: mainWindow,
+      modal: false,
+      autoHideMenuBar: true,
+    });
+
+    // Google OAuth via Supabase
+    const authUrl = `${supabaseUrl}/auth/v1/authorize?provider=google&redirect_to=${encodeURIComponent(redirectUrl)}`;
+    authWindow.loadURL(authUrl);
+
+    // Listen for navigation to our custom protocol callback
+    authWindow.webContents.on('will-navigate', (e, url) => {
+      if (url.startsWith('tuneless://')) {
+        e.preventDefault();
+        try {
+          const parsed = new URL(url);
+          const hash = parsed.hash.substring(1);
+          const params = new URLSearchParams(hash);
+          const accessToken = params.get('access_token');
+          const refreshToken = params.get('refresh_token');
+
+          if (accessToken && refreshToken) {
+            // Get user info from Supabase
+            https.get(`${supabaseUrl}/auth/v1/user`, {
+              headers: { Authorization: `Bearer ${accessToken}`, apikey: '' },
+            }, (res) => {
+              let data = '';
+              res.on('data', (c) => data += c);
+              res.on('end', () => {
+                try {
+                  const user = JSON.parse(data);
+                  mainWindow.webContents.send('auth:google-result', {
+                    access_token: accessToken,
+                    refresh_token: refreshToken,
+                    user,
+                  });
+                } catch {
+                  mainWindow.webContents.send('auth:google-result', {
+                    access_token: accessToken,
+                    refresh_token: refreshToken,
+                    user: null,
+                  });
+                }
+                authWindow.close();
+                resolve({ ok: true });
+              });
+            }).on('error', () => {
+              mainWindow.webContents.send('auth:google-result', {
+                access_token: accessToken,
+                refresh_token: refreshToken,
+                user: null,
+              });
+              authWindow.close();
+              resolve({ ok: true });
+            });
+          } else {
+            authWindow.close();
+            resolve({ ok: false, error: 'No tokens in callback' });
+          }
+        } catch (e) {
+          authWindow.close();
+          resolve({ ok: false, error: e.message });
+        }
+      }
+    });
+
+    // Also handle will-redirect (some OAuth flows use redirect instead of navigate)
+    authWindow.webContents.on('will-redirect', (e, url) => {
+      if (url.startsWith('tuneless://')) {
+        e.preventDefault();
+        // Same handling as will-navigate
+        try {
+          const parsed = new URL(url);
+          const hash = parsed.hash.substring(1);
+          const params = new URLSearchParams(hash);
+          const accessToken = params.get('access_token');
+          const refreshToken = params.get('refresh_token');
+          if (accessToken && refreshToken) {
+            mainWindow.webContents.send('auth:google-result', {
+              access_token: accessToken,
+              refresh_token: refreshToken,
+              user: null,
+            });
+          }
+        } catch {}
+        authWindow.close();
+        resolve({ ok: true });
+      }
+    });
+
+    // Handle window closed without auth
+    authWindow.on('closed', () => {
+      resolve({ ok: false, error: 'Window closed' });
+    });
+  });
+});
+
+// ── IPC: Spotify Playlist Import ────────────────────────────────────────
+ipcMain.handle('spotify:import-playlist', async (event, { clientId, clientSecret, playlistUrl }) => {
+  try {
+    // Extract playlist ID from URL
+    const match = playlistUrl.match(/playlist\/([a-zA-Z0-9]+)/);
+    if (!match) return { error: 'Invalid Spotify playlist URL' };
+    const playlistId = match[1];
+
+    // Get access token
+    const auth = Buffer.from(clientId + ':' + clientSecret).toString('base64');
+    const tokenData = await new Promise((resolve, reject) => {
+      const body = 'grant_type=client_credentials';
+      const req = https.request('https://accounts.spotify.com/api/token', {
+        method: 'POST',
+        headers: { 'Authorization': 'Basic ' + auth, 'Content-Type': 'application/x-www-urlencoded', 'Content-Length': body.length },
+      }, (res) => {
+        let d = ''; res.on('data', c => d += c);
+        res.on('end', () => { try { resolve(JSON.parse(d)); } catch { reject(new Error('Bad token response')); } });
+      });
+      req.on('error', reject);
+      req.write(body);
+      req.end();
+    });
+
+    if (!tokenData.access_token) return { error: 'Spotify auth failed' };
+
+    // Fetch playlist info
+    const plData = await new Promise((resolve, reject) => {
+      https.get(`https://api.spotify.com/v1/playlists/${playlistId}?fields=name,tracks.total`, {
+        headers: { 'Authorization': 'Bearer ' + tokenData.access_token },
+      }, (res) => {
+        let d = ''; res.on('data', c => d += c);
+        res.on('end', () => { try { resolve(JSON.parse(d)); } catch { reject(new Error('Bad playlist response')); } });
+      }).on('error', reject);
+    });
+
+    // Fetch all tracks (paginated, up to 500)
+    const tracks = [];
+    let offset = 0;
+    const limit = 100;
+    while (offset < Math.min(plData.tracks.total, 500)) {
+      const pageData = await new Promise((resolve, reject) => {
+        https.get(`https://api.spotify.com/v1/playlists/${playlistId}/tracks?offset=${offset}&limit=${limit}&fields=items(track(name,artists,album,duration_ms))`, {
+          headers: { 'Authorization': 'Bearer ' + tokenData.access_token },
+        }, (res) => {
+          let d = ''; res.on('data', c => d += c);
+          res.on('end', () => { try { resolve(JSON.parse(d)); } catch { reject(new Error('Bad tracks response')); } });
+        }).on('error', reject);
+      });
+      for (const item of (pageData.items || [])) {
+        const t = item.track;
+        if (!t) continue;
+        tracks.push({
+          name: t.name,
+          artist: t.artists.map(a => a.name).join(', '),
+          ytId: null,
+        });
+      }
+      offset += limit;
+    }
+
+    return { name: plData.name, trackCount: tracks.length, tracks };
+  } catch (e) {
+    return { error: e.message || 'Import failed' };
+  }
+});
+
 // ── IPC: Stream + search + resolve ───────────────────────────────
 ipcMain.handle('play:stream', async (event, { videoId }) => {
   const base = `http://127.0.0.1:${STREAM_PORT}/stream/${videoId}`;
@@ -314,7 +570,7 @@ ipcMain.handle('play:stream', async (event, { videoId }) => {
   // AND download the full audio in one pass. The proxy serves the file
   // once the download completes (~4-6s for a 3:30 song at 740KB/s).
   try {
-    const formatArg = 'bestaudio[ext=m4a]/bestaudio[acodec!=opus]/bestaudio';
+    const formatArg = 'bestaudio[ext=m4a][abr>128]/bestaudio[ext=m4a]/bestaudio[acodec!=opus]/bestaudio';
     const ytdlpArgs = [
       '-f', formatArg,
       '-o', tempPath,

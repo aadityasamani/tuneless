@@ -1,22 +1,48 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
     <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#000000;stop-opacity:1" />
-      <stop offset="100%" style="stop-color:#1a1a1a;stop-opacity:1" />
+      <stop offset="0%" stop-color="#1a1a2e"/>
+      <stop offset="50%" stop-color="#16213e"/>
+      <stop offset="100%" stop-color="#0f3460"/>
     </linearGradient>
+    <linearGradient id="bars" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#e94560"/>
+      <stop offset="100%" stop-color="#ff6b6b"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#e94560" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#533483" stop-opacity="0.1"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="12" flood-color="#e94560" flood-opacity="0.25"/>
+    </filter>
   </defs>
 
-  <!-- Solid dark circle -->
-  <circle cx="256" cy="256" r="248" fill="url(#bg)"/>
-  <circle cx="256" cy="256" r="248" fill="none" stroke="#ffffff" stroke-width="4" opacity="0.08"/>
+  <!-- Rounded square background -->
+  <rect x="16" y="16" width="480" height="480" rx="96" ry="96" fill="url(#bg)"/>
+  <rect x="16" y="16" width="480" height="480" rx="96" ry="96" fill="url(#glow)"/>
+  <rect x="16" y="16" width="480" height="480" rx="96" ry="96" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="2"/>
 
-  <!-- Bold "T" letter — modern, geometric, thick enough for any size -->
-  <!-- Horizontal bar -->
-  <rect x="160" y="170" width="192" height="36" rx="6" ry="6" fill="#ffffff"/>
+  <!-- Equalizer bars — the core visual -->
+  <g filter="url(#shadow)">
+    <!-- Bar 1 (left) — short -->
+    <rect x="155" y="260" width="32" height="80" rx="16" fill="url(#bars)"/>
+    <!-- Bar 2 — medium -->
+    <rect x="205" y="200" width="32" height="140" rx="16" fill="url(#bars)"/>
+    <!-- Bar 3 (center) — tallest -->
+    <rect x="255" y="160" width="32" height="180" rx="16" fill="url(#bars)"/>
+    <!-- Bar 4 — medium -->
+    <rect x="305" y="210" width="32" height="130" rx="16" fill="url(#bars)"/>
+    <!-- Bar 5 (right) — short -->
+    <rect x="355" y="250" width="32" height="90" rx="16" fill="url(#bars)"/>
+  </g>
 
-  <!-- Vertical stem — thick, clean -->
-  <rect x="238" y="170" width="36" height="182" rx="6" ry="6" fill="#ffffff"/>
+  <!-- Subtle play triangle at bottom -->
+  <path d="M 232 340 L 232 310 L 280 325 Z" fill="rgba(255,255,255,0.12)"/>
 
-  <!-- Subtle accent: small play triangle suggestion at bottom-right of T -->
-  <path d="M 300 320 L 330 335 L 300 350 Z" fill="#ffffff" opacity="0.3"/>
+  <!-- Small "T" mark in top-left corner -->
+  <g opacity="0.15">
+    <rect x="58" y="62" width="60" height="10" rx="5" fill="white"/>
+    <rect x="83" y="62" width="10" height="36" rx="5" fill="white"/>
+  </g>
 </svg>
