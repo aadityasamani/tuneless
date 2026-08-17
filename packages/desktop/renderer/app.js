@@ -616,8 +616,14 @@ audio.addEventListener('error', async (e) => {
       // Ensure we're not stuck in skipping state
       isSkipping = false;
       _currentStreamPromise = null;
-      // Skip to next track
-      setTimeout(() => nextTrack(), 500);
+      // Skip to next track directly without using processSkipQueue
+      const next = currentIdx + 1;
+      if (next < queue.length) {
+        setTimeout(() => playIndex(next, true), 500);
+      } else {
+        // If we're at the end, try to restart from beginning
+        setTimeout(() => playIndex(0, true), 500);
+      }
     } else {
       toast('Track not available - try a different song');
       setPlayerLoading(false);
@@ -1327,8 +1333,15 @@ async function playIndex(idx, manual) {
         // Ensure we're not stuck in skipping state
         isSkipping = false;
         _currentStreamPromise = null;
-        // Skip to next track
-        setTimeout(() => nextTrack(), 1000);
+        // Skip to next track directly without using processSkipQueue
+        // This ensures we don't get stuck in a skip queue loop
+        const next = currentIdx + 1;
+        if (next < queue.length) {
+          setTimeout(() => playIndex(next, true), 1000);
+        } else {
+          // If we're at the end, try to restart from beginning
+          setTimeout(() => playIndex(0, true), 1000);
+        }
       }
       return;
     }
