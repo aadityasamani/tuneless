@@ -9,6 +9,8 @@ let progressTimer = null;
 let playlists = JSON.parse(localStorage.getItem('tl_playlists') || '[]');
 let ytCache = JSON.parse(localStorage.getItem('tl_yt_cache') || '{}');
 let isStreamLoading = false;
+let isSkipping = false; // Prevent rapid skips
+let _skipQueue = []; // Queue of skips that need to be processed
 let currentPlaylistId = null;
 let _plFilter = '';
 let _fallbackUrl = null;
@@ -501,6 +503,8 @@ audio.addEventListener('pause', () => {
 audio.addEventListener('ended', () => {
   isPlaying = false; stopProgress();
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'none';
+  // Clear skip queue when track ends naturally
+  _skipQueue = [];
   // Check if there's a next track or if we should auto-recommend
   if (currentIdx + 1 < queue.length) {
     setTimeout(() => nextTrack(), crossfadeSec > 0 ? 800 : 500);
@@ -1198,6 +1202,7 @@ function playNextSearch(i) {
   if (existing >= 0) { toast('Already in queue'); return; }
   const song = { id: s.id, title: s.title, artist: s.artist, thumb: s.thumb || getYtThumb(s.id), duration: s.duration || '' };
   if (currentIdx >= 0 && currentIdx < queue.length) {
+    // Insert after current track
     queue.splice(currentIdx + 1, 0, song);
   } else {
     queue.push(song);
@@ -1230,6 +1235,11 @@ async function playIndex(idx, manual) {
   if (idx < 0 || idx >= queue.length) return;
   clearStallTimer(); _stallRetries = 0; _hasPlayedData = false;
   const song = queue[idx]; if (!song) return;
+
+  // Clear skip queue when starting a new track
+  if (isSkipping && _skipQueue.length > 0) {
+    _skipQueue = [];
+  }
 
   // Crossfade: only on auto-advance (song ending), NOT on manual skip
   // Skip when muted so we never restore stale volume
@@ -1277,12 +1287,23 @@ async function playIndex(idx, manual) {
     // Wait for the audio element to have enough data before playing
     await audio.play();
     toast('▶ ' + trunc(song.title, 50));
+    // Track has started playing, process any pending skips
+    onTrackStarted();
   } catch (e) {
     console.error('play error:', e);
     if (e.name === 'NotAllowedError') { setPlayerLoading(false); toast('Click play to start'); }
     else { toast('Failed to play: ' + (e.message || 'unknown')); setPlayerLoading(false); }
   }
   saveSession();
+}
+
+// Process skip queue after a track starts playing
+function onTrackStarted() {
+  isSkipping = false;
+  if (_skipQueue.length > 0) {
+    const nextIdx = _skipQueue.shift();
+    setTimeout(() => playIndex(nextIdx, true), 100);
+  }
 }
 
 function togglePlay() {
@@ -1306,8 +1327,26 @@ function togglePlay() {
   }
 }
 
+// Track history for proper previous navigation
+let trackHistory = [];
+
 function nextTrack() {
   if (!queue.length) return;
+  if (isSkipping) {
+    // Add to skip queue instead of processing immediately
+    _skipQueue.push(currentIdx + 1);
+    return;
+  }
+
+  // Add current track to history before moving to next
+  if (currentIdx >= 0 && queue[currentIdx]) {
+    trackHistory.push(currentIdx);
+    // Keep only last 50 tracks in history
+    if (trackHistory.length > 50) {
+      trackHistory.shift();
+    }
+  }
+
   let next;
   if (shuffleOn && queue.length > 1) {
     // Pick a random track that isn't the current one
@@ -1316,16 +1355,43 @@ function nextTrack() {
     next = currentIdx + 1;
     if (next >= queue.length) { if (repeatMode === 'all') next = 0; else return; }
   }
-  playIndex(next, true); if (tab === 'queue') renderQueue();
+  processSkipQueue(next);
 }
 
 function prevTrack() {
   if (!queue.length) return;
   if (audio.currentTime > 3) { audio.currentTime = 0; return; }
+
+  // Check if we have previous tracks in history
+  if (trackHistory.length > 0) {
+    // Go to the most recent track from history
+    const prevIdx = trackHistory.pop();
+    if (prevIdx >= 0 && prevIdx < queue.length) {
+      playIndex(prevIdx, true);
+      if (tab === 'queue') renderQueue();
+      return;
+    }
+  }
+
+  // Fallback to normal previous behavior
   let prev = currentIdx - 1;
   if (prev < 0) { if (repeatMode === 'all') prev = queue.length - 1; else return; }
-  playIndex(prev, true); if (tab === 'queue') renderQueue();
+  playIndex(prev, true);
+  if (tab === 'queue') renderQueue();
 }
+
+function processSkipQueue(nextIdx) {
+  if (!isSkipping) {
+    isSkipping = true;
+    // Process the next skip in the queue
+    if (_skipQueue.length > 0) {
+      nextIdx = _skipQueue.shift();
+    }
+    playIndex(nextIdx, true);
+    if (tab === 'queue') renderQueue();
+  }
+}
+
 
 function toggleShuffle() {
   shuffleOn = !shuffleOn;
@@ -1363,6 +1429,8 @@ function fpSeek(e) { const rect = e.currentTarget.getBoundingClientRect(); if (a
 function clearQ() {
   queue = []; currentIdx = -1; audio.pause(); audio.src = '';
   _fallbackUrl = null; _primaryUrl = null; _usingFallback = false;
+  trackHistory = []; // Clear track history when queue is cleared
+  _skipQueue = []; // Clear skip queue
   $('progress-fill').style.width = '0%';
   $('player-bar').style.display = 'none'; if (tab === 'queue') renderQueue(); closeFullPlayer();
   saveSession();
