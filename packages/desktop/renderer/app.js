@@ -11,6 +11,8 @@ let ytCache = JSON.parse(localStorage.getItem('tl_yt_cache') || '{}');
 let isStreamLoading = false;
 let isSkipping = false; // Prevent rapid skips
 let _skipQueue = []; // Queue of skips that need to be processed
+let _currentStreamPromise = null; // Track the current stream request
+let _isCanceling = false; // Flag to indicate we're canceling current stream
 let currentPlaylistId = null;
 let _plFilter = '';
 let _fallbackUrl = null;
@@ -1233,6 +1235,13 @@ function playFromQ(i) { currentIdx = i; playIndex(i, true); renderQueue(); saveS
 
 async function playIndex(idx, manual) {
   if (idx < 0 || idx >= queue.length) return;
+
+  // Cancel any ongoing stream request if we're skipping
+  if (_isCanceling) {
+    _isCanceling = false;
+    _currentStreamPromise = null;
+  }
+
   clearStallTimer(); _stallRetries = 0; _hasPlayedData = false;
   const song = queue[idx]; if (!song) return;
 
@@ -1241,34 +1250,48 @@ async function playIndex(idx, manual) {
     _skipQueue = [];
   }
 
-  // Crossfade: only on auto-advance (song ending), NOT on manual skip
-  // Skip when muted so we never restore stale volume
-  if (!manual && crossfadeSec > 0 && !isMuted && audio.src && !audio.paused) {
-    const fadeDuration = Math.min(crossfadeSec, 1.5); // cap at 1.5s even for auto
-    const fadeSteps = 8;
-    const fadeInterval = (fadeDuration * 1000) / fadeSteps;
-    const startVol = audio.volume;
-    for (let i = fadeSteps; i >= 0; i--) {
-      audio.volume = startVol * (i / fadeSteps);
-      await new Promise(r => setTimeout(r, fadeInterval));
-    }
-  } else if (audio.src && !audio.paused) {
-    // Manual skip: cut instantly
-    audio.volume = 0;
+  // Stop current audio immediately when skipping
+  if (audio.src) {
+    audio.pause();
+    audio.src = '';
+    _fallbackUrl = null;
+    _primaryUrl = null;
   }
-  audio.volume = isMuted ? 0 : currentVol;
 
+  // Clear skip queue when starting a new track
+  if (isSkipping && _skipQueue.length > 0) {
+    _skipQueue = [];
+  }
+
+  // Set loading state
   currentIdx = idx; updateNowPlaying(song); setPlayerLoading(true);
   addToRecentlyPlayed(song);
+
   try {
-    const urls = await window.tuneless.playStream(song.id);
+    // Create a new stream request
+    _isCanceling = false;
+    _currentStreamPromise = window.tuneless.playStream(song.id);
+    const urls = await _currentStreamPromise;
+
+    // Check if this request was canceled
+    if (_isCanceling) {
+      console.log('[playIndex] Stream request was canceled, skipping to next');
+      if (queue.length > 1) {
+        setTimeout(() => nextTrack(), 1000);
+      }
+      return;
+    }
+
     if (urls?.error) {
       console.error('[playIndex] stream error:', urls.error);
       setPlayerLoading(false);
       _fallbackUrl = null; _primaryUrl = null;
       const isBot = /bot-check|cookies/i.test(urls.error);
+      const isNotFound = /not found|exit 1|could not resolve/i.test(urls.error);
       if (isBot) {
         toast('YouTube blocked this track — import cookies.txt in Settings to fix');
+      } else if (isNotFound) {
+        toast('Could not find audio stream for this track');
       } else {
         toast('Could not get audio stream: ' + urls.error);
       }
@@ -1300,6 +1323,8 @@ async function playIndex(idx, manual) {
 // Process skip queue after a track starts playing
 function onTrackStarted() {
   isSkipping = false;
+  _currentStreamPromise = null;
+
   if (_skipQueue.length > 0) {
     const nextIdx = _skipQueue.shift();
     setTimeout(() => playIndex(nextIdx, true), 100);
@@ -1338,13 +1363,9 @@ function nextTrack() {
     return;
   }
 
-  // Add current track to history before moving to next
-  if (currentIdx >= 0 && queue[currentIdx]) {
-    trackHistory.push(currentIdx);
-    // Keep only last 50 tracks in history
-    if (trackHistory.length > 50) {
-      trackHistory.shift();
-    }
+  // Cancel any ongoing stream request
+  if (_currentStreamPromise) {
+    _isCanceling = true;
   }
 
   let next;
