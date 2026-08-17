@@ -596,12 +596,37 @@ audio.addEventListener('error', async (e) => {
   const errCode = audio.error ? audio.error.code : 0;
   const errMsg = audio.error && audio.error.message ? audio.error.message : 'unknown';
   console.error('Audio error:', 'code=' + errCode, 'msg=' + errMsg);
+
+  // Check if this is a stream resolution error (YTDLP related)
+  const isStreamError = /not found|exit 1|could not resolve|ytdlp/i.test(errMsg);
+
   // For decode / unsupported / network errors — try fallback format first
   if (!_usingFallback && _fallbackUrl && (errCode === 3 || errCode === 4 || errCode === 2)) {
     console.warn('[audio] trying fallback after decode error');
     const ok = await tryFallbackFormat();
     if (ok) return;
   }
+
+  // For stream resolution errors, skip immediately
+  if (isStreamError) {
+    if (queue.length > 1) {
+      toast('Track not available - skipping');
+      // Cancel any pending skip queue
+      _skipQueue = [];
+      // Ensure we're not stuck in skipping state
+      isSkipping = false;
+      _currentStreamPromise = null;
+      // Skip to next track
+      setTimeout(() => nextTrack(), 500);
+    } else {
+      toast('Track not available - try a different song');
+      setPlayerLoading(false);
+      _fallbackUrl = null; _primaryUrl = null;
+    }
+    return;
+  }
+
+  // For other audio errors
   if (queue.length > 1) {
     toast('Playback error - skipping to next');
     _fallbackUrl = null; _primaryUrl = null;
@@ -1295,9 +1320,15 @@ async function playIndex(idx, manual) {
       } else {
         toast('Could not get audio stream: ' + urls.error);
       }
-      // Skip to next track instead of redirecting away from current view
+      // Force skip to next track immediately, even if in skip queue
       if (queue.length > 1) {
-        setTimeout(() => nextTrack(), 1500);
+        // Cancel any pending skip queue
+        _skipQueue = [];
+        // Ensure we're not stuck in skipping state
+        isSkipping = false;
+        _currentStreamPromise = null;
+        // Skip to next track
+        setTimeout(() => nextTrack(), 1000);
       }
       return;
     }
