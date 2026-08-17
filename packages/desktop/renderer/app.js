@@ -503,22 +503,38 @@ audio.addEventListener('pause', () => {
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
 });
 audio.addEventListener('ended', () => {
+  console.log('Audio ended event fired, currentIdx:', currentIdx, 'queue length:', queue.length);
   isPlaying = false; stopProgress();
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'none';
   // Clear skip queue when track ends naturally
   _skipQueue = [];
   // Check if there's a next track or if we should auto-recommend
   if (currentIdx + 1 < queue.length) {
+    console.log('Auto-advancing to next track');
     setTimeout(() => nextTrack(), crossfadeSec > 0 ? 800 : 500);
   } else if (autoplay && API_KEY) {
+    console.log('Queue ended, auto-recommending');
     setTimeout(() => {
       autoRecommend().then(() => {
         // Try to play the first recommendation if queue was empty
-        if (currentIdx + 1 < queue.length) nextTrack();
-        else if (queue.length > 0 && currentIdx < queue.length - 1) nextTrack();
+        if (currentIdx + 1 < queue.length) {
+          console.log('Playing first recommendation');
+          nextTrack();
+        } else if (queue.length > 0 && currentIdx < queue.length - 1) {
+          console.log('Playing next in queue after recommendation');
+          nextTrack();
+        }
       });
     }, 1000);
+  } else {
+    console.log('Queue ended, no auto-advance');
   }
+});
+audio.addEventListener('seeking', () => {
+  console.log('Audio seeking to:', audio.currentTime, 'duration:', audio.duration);
+});
+audio.addEventListener('seeked', () => {
+  console.log('Audio seeked to:', audio.currentTime, 'duration:', audio.duration);
 });
 audio.addEventListener('timeupdate', () => { _hasPlayedData = true; updateTimeDisplay(); clearStallTimer(); });
 let _stallTimer = null;
@@ -617,13 +633,8 @@ audio.addEventListener('error', async (e) => {
       isSkipping = false;
       _currentStreamPromise = null;
       // Skip to next track directly without using processSkipQueue
-      const next = currentIdx + 1;
-      if (next < queue.length) {
-        setTimeout(() => playIndex(next, true), 500);
-      } else {
-        // If we're at the end, try to restart from beginning
-        setTimeout(() => playIndex(0, true), 500);
-      }
+      // This ensures we don't get stuck in a skip queue loop
+      setTimeout(() => nextTrack(), 500);
     } else {
       toast('Track not available - try a different song');
       setPlayerLoading(false);
@@ -1333,15 +1344,8 @@ async function playIndex(idx, manual) {
         // Ensure we're not stuck in skipping state
         isSkipping = false;
         _currentStreamPromise = null;
-        // Skip to next track directly without using processSkipQueue
-        // This ensures we don't get stuck in a skip queue loop
-        const next = currentIdx + 1;
-        if (next < queue.length) {
-          setTimeout(() => playIndex(next, true), 1000);
-        } else {
-          // If we're at the end, try to restart from beginning
-          setTimeout(() => playIndex(0, true), 1000);
-        }
+        // Use nextTrack() to ensure proper queue handling
+        setTimeout(() => nextTrack(), 1000);
       }
       return;
     }
@@ -1488,7 +1492,15 @@ function toggleRepeat() {
   toast('Repeat: ' + repeatMode);
 }
 
-function seekTo(e) { const rect = e.currentTarget.getBoundingClientRect(); if (audio.duration) audio.currentTime = ((e.clientX - rect.left) / rect.width) * audio.duration; }
+function seekTo(e) {
+  console.log('seekTo called, audio duration:', audio.duration, 'currentTime:', audio.currentTime);
+  const rect = e.currentTarget.getBoundingClientRect();
+  if (audio.duration) {
+    const newTime = ((e.clientX - rect.left) / rect.width) * audio.duration;
+    console.log('Setting currentTime to:', newTime);
+    audio.currentTime = newTime;
+  }
+}
 function fpSeek(e) { const rect = e.currentTarget.getBoundingClientRect(); if (audio.duration) audio.currentTime = ((e.clientX - rect.left) / rect.width) * audio.duration; }
 
 function clearQ() {
