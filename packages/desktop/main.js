@@ -34,10 +34,71 @@ try {
 // <audio> element — zero truncation, zero buffering issues.
 const TEMP_DIR = path.join(app?.getPath('temp') || '/tmp', 'tuneless-audio');
 try { require('fs').mkdirSync(TEMP_DIR, { recursive: true }); } catch {}
-function getTempPath(videoId) { return path.join(TEMP_DIR, `${videoId}.m4a`); }
+function getTempPath(videoId, format = 'primary') {
+  // Preserve the v2.0.7 primary-cache filename so existing complete downloads
+  // remain playable without another yt-dlp request. Only fallback needs a
+  // distinct cache file.
+  return path.join(TEMP_DIR, format === 'fallback' ? `${videoId}.fallback.m4a` : `${videoId}.m4a`);
+}
+
+function serveAudioFile(req, res, filePath) {
+  const { size } = fs.statSync(filePath);
+  const headers = {
+    'Content-Type': 'audio/mp4',
+    'Accept-Ranges': 'bytes',
+  };
+  const range = req.headers.range;
+
+  if (!range) {
+    res.writeHead(200, { ...headers, 'Content-Length': size });
+    if (req.method === 'HEAD') res.end();
+    else fs.createReadStream(filePath).pipe(res);
+    return;
+  }
+
+  const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+  if (!match || (!match[1] && !match[2])) {
+    res.writeHead(416, { ...headers, 'Content-Range': `bytes */${size}`, 'Content-Length': 0 });
+    res.end();
+    return;
+  }
+
+  let start;
+  let end;
+  if (!match[1]) {
+    const suffixLength = Number(match[2]);
+    if (suffixLength === 0) {
+      res.writeHead(416, { ...headers, 'Content-Range': `bytes */${size}`, 'Content-Length': 0 });
+      res.end();
+      return;
+    }
+    start = Math.max(size - suffixLength, 0);
+    end = size - 1;
+  } else {
+    start = Number(match[1]);
+    end = match[2] ? Math.min(Number(match[2]), size - 1) : size - 1;
+  }
+
+  if (start >= size || start > end) {
+    res.writeHead(416, { ...headers, 'Content-Range': `bytes */${size}`, 'Content-Length': 0 });
+    res.end();
+    return;
+  }
+
+  res.writeHead(206, {
+    ...headers,
+    'Content-Range': `bytes ${start}-${end}/${size}`,
+    'Content-Length': end - start + 1,
+  });
+  if (req.method === 'HEAD') res.end();
+  else fs.createReadStream(filePath, { start, end }).pipe(res);
+}
 
 let mainWindow;
 let streamServer;
+// Shared by foreground playback and background preloading. A track may only
+// have one yt-dlp process writing its cache file at a time.
+const activeDownloads = new Map();
 
 // ── Local HTTP proxy ───────────────────────────────────────────────────
 // Uses yt-dlp to extract audio stream URLs. yt-dlp is the gold standard for
@@ -56,17 +117,12 @@ function startStreamServer() {
     console.log(`[stream] request: /${videoId} ${useFallback ? '(fallback)' : '(primary)'}`);
 
     // ── Check for cached temp file from a previous pipe download ──
-    const tempPath = getTempPath(videoId);
+    const tempPath = getTempPath(videoId, useFallback ? 'fallback' : 'primary');
     if (fs.existsSync(tempPath)) {
       const stat = fs.statSync(tempPath);
       if (stat.size > 0) {
         console.log(`[stream] serving cached file ${videoId} (${stat.size} bytes)`);
-        res.writeHead(200, {
-          'Content-Type': 'audio/mp4',
-          'Content-Length': stat.size,
-          'Accept-Ranges': 'bytes',
-        });
-        fs.createReadStream(tempPath).pipe(res);
+        serveAudioFile(req, res, tempPath);
         return;
       }
     }
@@ -79,7 +135,7 @@ function startStreamServer() {
     try {
       const formatArg = useFallback
         ? 'bestaudio[acodec!=opus]/bestaudio[ext=m4a]/bestaudio'
-        : 'bestaudio[ext=m4a][abr>128]/bestaudio[ext=m4a]/bestaudio[acodec!=opus]/bestaudio';
+        : 'bestaudio[ext=m4a]/bestaudio[acodec!=opus]/bestaudio';
       const ytdlpArgs = [
         '-f', formatArg,
         '-o', tempPath,
@@ -117,14 +173,8 @@ function startStreamServer() {
         req.on('close', () => { if (!proc.killed) proc.kill(); });
       });
 
-      // Serve the complete file
-      const stat = fs.statSync(tempPath);
-      res.writeHead(200, {
-        'Content-Type': 'audio/mp4',
-        'Content-Length': stat.size,
-        'Accept-Ranges': 'bytes',
-      });
-      fs.createReadStream(tempPath).pipe(res);
+      // Serve the complete, locally cached file after yt-dlp finishes.
+      serveAudioFile(req, res, tempPath);
 
     } catch (err) {
       console.error('[stream] error:', err.message);
@@ -347,6 +397,23 @@ ipcMain.handle('ytdlp:version', async () => {
   } catch (e) { return 'ERROR: ' + e.message; }
 });
 
+ipcMain.handle('cache:status', async () => {
+  try {
+    const files = fs.readdirSync(TEMP_DIR, { withFileTypes: true })
+      .filter(entry => entry.isFile() && entry.name.endsWith('.m4a'));
+    const bytes = files.reduce((total, entry) => total + fs.statSync(path.join(TEMP_DIR, entry.name)).size, 0);
+    return { files: files.length, bytes };
+  } catch (e) { return { files: 0, bytes: 0, error: e.message }; }
+});
+
+ipcMain.handle('cache:clear', async () => {
+  try {
+    fs.rmSync(TEMP_DIR, { recursive: true, force: true });
+    fs.mkdirSync(TEMP_DIR, { recursive: true });
+    return { ok: true };
+  } catch (e) { return { ok: false, message: e.message }; }
+});
+
 // ── IPC: Cookies for YouTube bot-check bypass ─────────────────────
 ipcMain.handle('cookies:status', async () => {
   const p = path.join(app.getPath('userData'), 'cookies.txt');
@@ -555,54 +622,69 @@ ipcMain.handle('spotify:import-playlist', async (event, { clientId, clientSecret
 });
 
 // ── IPC: Stream + search + resolve ───────────────────────────────
-ipcMain.handle('play:stream', async (event, { videoId }) => {
-  const base = `http://127.0.0.1:${STREAM_PORT}/stream/${videoId}`;
-  console.log('[play:stream]', videoId);
+async function downloadPrimaryAudio(videoId, reason = 'play') {
+  const tempPath = getTempPath(videoId, 'primary');
+  if (fs.existsSync(tempPath) && fs.statSync(tempPath).size > 0) return { cached: true };
 
-  // If the temp file already exists from a previous play, return immediately
-  // (no yt-dlp wait — the proxy will serve the cached file in ~0ms).
-  const tempPath = getTempPath(videoId);
-  if (fs.existsSync(tempPath) && fs.statSync(tempPath).size > 0) {
-    return { primary: base, fallback: base };
-  }
+  const existing = activeDownloads.get(videoId);
+  if (existing) return existing;
 
-  // For new songs: run yt-dlp to validate extraction works (bot-check detection)
-  // AND download the full audio in one pass. The proxy serves the file
-  // once the download completes (~4-6s for a 3:30 song at 740KB/s).
-  try {
-    const formatArg = 'bestaudio[ext=m4a][abr>128]/bestaudio[ext=m4a]/bestaudio[acodec!=opus]/bestaudio';
+  const task = new Promise((resolve, reject) => {
     const ytdlpArgs = [
-      '-f', formatArg,
+      '-f', 'bestaudio[ext=m4a]/bestaudio[acodec!=opus]/bestaudio',
       '-o', tempPath,
       '--no-warnings',
       '--extractor-retries', '2',
     ];
     if (COOKIES_PATH) ytdlpArgs.push('--cookies', COOKIES_PATH);
     ytdlpArgs.push(`https://www.youtube.com/watch?v=${videoId}`);
-
-    await new Promise((resolve, reject) => {
-      const proc = execFile(YTDLP_PATH, ytdlpArgs, { timeout: 120000 });
-      let stderrBuf = '';
-      proc.stderr.on('data', (chunk) => { stderrBuf += chunk.toString(); });
-      proc.on('close', (code) => {
-        if (code === 0 && fs.existsSync(tempPath) && fs.statSync(tempPath).size > 0) {
-          const size = fs.statSync(tempPath).size;
-          console.log(`[play:stream] downloaded ${videoId}: ${size} bytes`);
-          resolve();
-        } else {
-          const isBot = /sign in to confirm|not a bot|bot.?check/i.test(stderrBuf);
-          if (isBot) reject(new Error('YouTube bot-check: set up cookies in Settings'));
-          else reject(new Error('yt-dlp failed (exit ' + code + ')'));
-        }
-      });
-      proc.on('error', reject);
+    console.log(`[stream:${reason}] downloading ${videoId}`);
+    const proc = execFile(YTDLP_PATH, ytdlpArgs, { timeout: 120000 });
+    let stderrBuf = '';
+    proc.stderr.on('data', chunk => { stderrBuf += chunk.toString(); });
+    proc.on('close', code => {
+      if (code === 0 && fs.existsSync(tempPath) && fs.statSync(tempPath).size > 0) {
+        const size = fs.statSync(tempPath).size;
+        console.log(`[stream:${reason}] downloaded ${videoId}: ${size} bytes`);
+        resolve({ cached: false, bytes: size });
+      } else {
+        const isBot = /sign in to confirm|not a bot|bot.?check/i.test(stderrBuf);
+        reject(new Error(isBot ? 'YouTube bot-check: set up cookies in Settings' : 'yt-dlp failed (exit ' + code + ')'));
+      }
     });
+    proc.on('error', reject);
+  });
 
-    return { primary: base, fallback: base };
+  activeDownloads.set(videoId, task);
+  try {
+    return await task;
+  } catch (error) {
+    try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
+    throw error;
+  } finally {
+    activeDownloads.delete(videoId);
+  }
+}
+
+ipcMain.handle('play:stream', async (event, { videoId }) => {
+  const base = `http://127.0.0.1:${STREAM_PORT}/stream/${videoId}`;
+  const fallback = `${base}?format=fallback`;
+  try {
+    await downloadPrimaryAudio(videoId, 'play');
+    return { primary: base, fallback };
   } catch (e) {
     console.error('[play:stream] failed:', e.message);
-    try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
     return { error: e.message || 'Could not get audio stream' };
+  }
+});
+
+ipcMain.handle('preload:stream', async (event, { videoId }) => {
+  try {
+    const result = await downloadPrimaryAudio(videoId, 'preload');
+    return { ok: true, ...result };
+  } catch (e) {
+    console.warn('[preload:stream] failed:', videoId, e.message);
+    return { ok: false, error: e.message || 'Could not preload audio' };
   }
 });
 

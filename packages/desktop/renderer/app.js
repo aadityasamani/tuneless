@@ -4,11 +4,19 @@ const audio = $('audio-player');
 
 let API_KEY = localStorage.getItem('tl_api_key') || '';
 let tab = 'search', searchResults = [], queue = [], currentIdx = -1;
-let isPlaying = false, shuffleOn = true, repeatMode = 'off';
+let activeSearchQuery = '', searchRequestId = 0;
+let isPlaying = false, shuffleOn = false, repeatMode = 'off';
 let progressTimer = null;
 let playlists = JSON.parse(localStorage.getItem('tl_playlists') || '[]');
 let ytCache = JSON.parse(localStorage.getItem('tl_yt_cache') || '{}');
 let isStreamLoading = false;
+// Every playback attempt gets an ID. Async yt-dlp results and timers from older
+// attempts must never be allowed to replace or skip the newly selected track.
+let _playRequestId = 0;
+let _pendingAdvanceTimer = null;
+let _playNextIds = [];
+let upcomingPreloadLimit = Math.max(0, Math.min(3, parseInt(localStorage.getItem('tl_preload_limit') || '2', 10) || 0));
+let _failedTrackIds = new Set();
 let currentPlaylistId = null;
 let _plFilter = '';
 let _fallbackUrl = null;
@@ -381,6 +389,36 @@ function refreshRecommendations() {
   }
 }
 
+function cancelPendingAdvance() {
+  if (_pendingAdvanceTimer) {
+    clearTimeout(_pendingAdvanceTimer);
+    _pendingAdvanceTimer = null;
+  }
+}
+
+function scheduleAdvance(delay, requestId = _playRequestId) {
+  cancelPendingAdvance();
+  _pendingAdvanceTimer = setTimeout(() => {
+    _pendingAdvanceTimer = null;
+    if (requestId === _playRequestId) nextTrack({ automatic: true });
+  }, delay);
+}
+
+function showPlaybackAlert(title, message, actionLabel, action) {
+  const alert = $('playback-alert');
+  if (!alert) return;
+  $('playback-alert-title').textContent = title;
+  $('playback-alert-message').textContent = message;
+  const button = $('playback-alert-action');
+  button.textContent = actionLabel;
+  button.onclick = action;
+  alert.classList.add('visible');
+}
+
+function dismissPlaybackAlert() {
+  $('playback-alert')?.classList.remove('visible');
+}
+
 function addToRecentlyPlayed(song) {
   if (!song) return;
   recentlyPlayed = recentlyPlayed.filter(r => r.id !== song.id);
@@ -483,7 +521,7 @@ function updateVolIcon() {
 
 // ── AUDIO EVENTS ─────────────────────────────────────────────────────────
 audio.addEventListener('play', () => {
-  isPlaying = true; isStreamLoading = false;
+  isPlaying = true; isStreamLoading = false; dismissPlaybackAlert();
   updatePlayButtons(); startProgress();
   // Ensure media session is active with correct state
   setupMediaSession();
@@ -499,20 +537,31 @@ audio.addEventListener('pause', () => {
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
 });
 audio.addEventListener('ended', () => {
+  console.log('Audio ended event fired, currentIdx:', currentIdx, 'queue length:', queue.length);
   isPlaying = false; stopProgress();
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'none';
-  // Check if there's a next track or if we should auto-recommend
-  if (currentIdx + 1 < queue.length) {
-    setTimeout(() => nextTrack(), crossfadeSec > 0 ? 800 : 500);
+  const completedRequestId = _playRequestId;
+  if (hasNextTrack()) {
+    console.log('Auto-advancing to next track');
+    scheduleAdvance(crossfadeSec > 0 ? 800 : 500, completedRequestId);
   } else if (autoplay && API_KEY) {
-    setTimeout(() => {
-      autoRecommend().then(() => {
-        // Try to play the first recommendation if queue was empty
-        if (currentIdx + 1 < queue.length) nextTrack();
-        else if (queue.length > 0 && currentIdx < queue.length - 1) nextTrack();
-      });
+    console.log('Queue ended, auto-recommending');
+    cancelPendingAdvance();
+    _pendingAdvanceTimer = setTimeout(async () => {
+      _pendingAdvanceTimer = null;
+      if (completedRequestId !== _playRequestId) return;
+      await autoRecommend();
+      if (completedRequestId === _playRequestId && hasNextTrack()) nextTrack({ automatic: true });
     }, 1000);
+  } else {
+    console.log('Queue ended, no auto-advance');
   }
+});
+audio.addEventListener('seeking', () => {
+  console.log('Audio seeking to:', audio.currentTime, 'duration:', audio.duration);
+});
+audio.addEventListener('seeked', () => {
+  console.log('Audio seeked to:', audio.currentTime, 'duration:', audio.duration);
 });
 audio.addEventListener('timeupdate', () => { _hasPlayedData = true; updateTimeDisplay(); clearStallTimer(); });
 let _stallTimer = null;
@@ -529,8 +578,9 @@ async function tryFallbackFormat() {
   const position = audio.currentTime || 0;
   const wasPlaying = !audio.paused;
   try {
-    // Use ?v= cache-buster (NOT &) — primary URL has no query string
-    audio.src = _fallbackUrl + '&v=' + Date.now();
+    const fallbackUrl = new URL(_fallbackUrl);
+    fallbackUrl.searchParams.set('v', Date.now().toString());
+    audio.src = fallbackUrl.toString();
     if (position > 0) audio.currentTime = position;
     if (wasPlaying) await audio.play();
     toast('Switched to alternate stream');
@@ -543,68 +593,35 @@ async function tryFallbackFormat() {
 
 function startStallTimer() {
   clearStallTimer();
-  // First load can take a while — yt-dlp has to extract the stream URL (5-15s).
-  // Only react fast (3s) for mid-playback stalls, where we already had audio.
+  const requestId = _playRequestId;
+  // First load can take a while — yt-dlp has to download the complete file.
   const delay = _hasPlayedData ? 3000 : 15000;
   _stallTimer = setTimeout(async () => {
     clearStallTimer();
+    if (requestId !== _playRequestId) return;
     _stallRetries++;
     console.warn('[audio] stall detected (retry ' + _stallRetries + ')');
-    if (_stallRetries === 1) {
-      // First stall → try fallback format immediately (preserving position)
-      const ok = await tryFallbackFormat();
-      if (ok) { _stallRetries = 0; return; }
+    if (_stallRetries === 1 && await tryFallbackFormat()) {
+      _stallRetries = 0;
+      return;
     }
-    if (_stallRetries <= 2 && queue[currentIdx]) {
-      // Second attempt: try fresh URL for primary format
-      toast('Buffering... retrying stream');
-      try {
-        const song = queue[currentIdx];
-        const urls = await window.tuneless.playStream(song.id);
-        if (urls?.error) {
-          console.warn('[audio] stream retry blocked:', urls.error);
-          toast('YouTube blocked playback — set up cookies in Settings');
-        } else if (urls?.primary) {
-          _primaryUrl = urls.primary;
-          _fallbackUrl = urls.fallback;
-          _usingFallback = false;
-          audio.src = urls.primary + '?v=' + Date.now();
-          await audio.play();
-          return;
-        }
-      } catch (e) {
-        console.warn('[audio] stream retry failed:', e);
-      }
-    }
-    // Give up and skip
-    toast('Stream failed - skipping to next');
-    _stallRetries = 0; _fallbackUrl = null; _primaryUrl = null;
-    if (queue.length > 1) nextTrack();
-    else { audio.pause(); audio.src = ''; isStreamLoading = false; updatePlayButtons(); }
-  }, _hasPlayedData ? 3000 : 15000);
+    handleTrackFailure(requestId, 'Stream stalled');
+  }, delay);
 }
 audio.addEventListener('waiting', () => { isStreamLoading = true; updatePlayButtons(); startStallTimer(); });
 audio.addEventListener('canplay', () => { _hasPlayedData = true; isStreamLoading = false; updatePlayButtons(); clearStallTimer(); _stallRetries = 0; });
 audio.addEventListener('playing', () => { _hasPlayedData = true; isStreamLoading = false; updatePlayButtons(); clearStallTimer(); _stallRetries = 0; });
-audio.addEventListener('error', async (e) => {
+audio.addEventListener('error', async () => {
+  // A source can emit an error after it has been replaced; only the current
+  // playback attempt may decide what happens next.
+  const requestId = _playRequestId;
   const errCode = audio.error ? audio.error.code : 0;
-  const errMsg = audio.error && audio.error.message ? audio.error.message : 'unknown';
+  const errMsg = audio.error?.message || 'Audio playback failed';
   console.error('Audio error:', 'code=' + errCode, 'msg=' + errMsg);
-  // For decode / unsupported / network errors — try fallback format first
-  if (!_usingFallback && _fallbackUrl && (errCode === 3 || errCode === 4 || errCode === 2)) {
-    console.warn('[audio] trying fallback after decode error');
-    const ok = await tryFallbackFormat();
-    if (ok) return;
+  if (!_usingFallback && _fallbackUrl && (errCode === 2 || errCode === 3 || errCode === 4)) {
+    if (await tryFallbackFormat()) return;
   }
-  if (queue.length > 1) {
-    toast('Playback error - skipping to next');
-    _fallbackUrl = null; _primaryUrl = null;
-    setTimeout(() => nextTrack(), 1500);
-  } else {
-    toast('Playback failed - try a different song');
-    setPlayerLoading(false);
-    _fallbackUrl = null; _primaryUrl = null;
-  }
+  handleTrackFailure(requestId, errMsg);
 });
 
 // ── MEDIA SESSION ────────────────────────────────────────────────────────
@@ -751,21 +768,29 @@ function onSearchInput(e) {
 $('search-clear').addEventListener('click', clearSearch);
 function clearSearch() {
   $('search-input').value = ''; $('search-clear').classList.remove('visible');
-  searchResults = []; window._lq = '';
+  searchRequestId++;
+  searchResults = []; activeSearchQuery = ''; window._lq = '';
   if (tab === 'search') renderSearch();
 }
 
 async function doSearch(q) {
   if (!q || q === window._lq) return;
   window._lq = q;
+  const requestId = ++searchRequestId;
+  activeSearchQuery = q;
   if (tab !== 'search') switchTab('search');
   if (!API_KEY) { renderEmpty('No API Key', 'Go to Settings and paste your YouTube Data API key'); return; }
   renderLoading();
   try {
-    searchResults = await window.tuneless.searchYoutube(q + ' official audio', API_KEY);
+    const results = await window.tuneless.searchYoutube(q + ' official audio', API_KEY);
+    // Searches can resolve out of order. Never replace newer results with a
+    // response for a query the user has already changed.
+    if (requestId !== searchRequestId) return;
+    searchResults = results;
     searchResults.forEach(r => { if (!r.thumb) r.thumb = getYtThumb(r.id); });
     renderSearch();
   } catch (e) {
+    if (requestId !== searchRequestId) return;
     console.error('Search error:', e);
     renderEmpty('Search failed', e.message ? e.message : 'Check your API key and internet connection');
   }
@@ -782,97 +807,116 @@ function renderEmpty(t, s) {
 function renderSearch() {
   if (tab !== 'search') return;
   if (!searchResults.length) {
-    $('content').innerHTML = `<div class="state-msg"><div class="state-icon">&#x2315;</div><div class="state-title">Search</div><div class="state-sub">Type a song or artist above</div></div>`;
+    $('content').innerHTML = `<section class="search-page search-empty"><header class="search-page-header"><div><div class="page-kicker">Discover</div><h1 class="page-title">Find your next track</h1><p class="page-description">Search YouTube for songs, artists, albums, or mixes.</p></div><div class="search-shortcut"><kbd>Ctrl</kbd><span>+</span><kbd>K</kbd></div></header><div class="state-msg"><div class="state-icon">&#x2315;</div><div class="state-title">What do you want to hear?</div><div class="state-sub">Start typing above. Search results can be played now, placed next, or added to the end of your queue.</div></div></section>`;
     return;
   }
-  $('content').innerHTML = `<div class="track-list">${searchResults.map((r,i) => trackHtml(r,i,'search')).join('')}</div>`;
+  const countLabel = `${searchResults.length} result${searchResults.length === 1 ? '' : 's'}`;
+  $('content').innerHTML = `<section class="search-page"><header class="search-page-header"><div><div class="page-kicker">Search results</div><h1 class="page-title">${esc(activeSearchQuery)}</h1><p class="page-description">Play a result now or line it up without losing your place.</p></div><div class="result-count">${countLabel}</div></header><div class="search-results-heading"><span>Tracks</span><span>Actions</span></div><div class="track-list search-results">${searchResults.map((r,i) => trackHtml(r,i,'search')).join('')}</div></section>`;
 }
 
 function renderLibrary() {
   if (tab !== 'library') return;
 
-  // Build full playlist list including Liked Songs
-  let allPls = [...playlists];
-  const likedPl = getLikedPlaylist();
-  if (likedPl) allPls.unshift(likedPl);
+  const likedPlaylist = getLikedPlaylist();
+  const allPlaylists = likedPlaylist ? [likedPlaylist, ...playlists] : [...playlists];
+  const totalTracks = allPlaylists.reduce((total, playlist) => total + (playlist.trackCount || 0), 0);
+  let html = `<section class="library-page"><header class="library-header"><div><div class="page-kicker">Your collection</div><h1 class="page-title">Library</h1><p class="page-description">${allPlaylists.length ? `${allPlaylists.length} playlist${allPlaylists.length === 1 ? '' : 's'} · ${totalTracks} track${totalTracks === 1 ? '' : 's'}` : 'Create a playlist or bring your music into Tuneless.'}</p></div></header><section class="library-actions"><button class="library-action primary" type="button" onclick="createNewPlaylist()"><span class="library-action-icon">+</span><span><strong>New playlist</strong><small>Start from scratch</small></span></button><button class="library-action" type="button" onclick="$('file-input').click()"><span class="library-action-icon">⇧</span><span><strong>Import file</strong><small>CSV or JSON export</small></span></button><button class="library-action spotify" type="button" onclick="importSpotifyPlaylist()"><span class="library-action-icon">↗</span><span><strong>Import Spotify</strong><small>From a playlist URL</small></span></button><input type="file" id="file-input" accept=".csv,.json" multiple hidden></section>`;
 
-  let html = `<div class="section-header"><span class="section-title">Playlists (${allPls.length})</span></div>`;
-  html += `<div class="library-content">
-    <div style="display:flex;gap:8px;margin-bottom:12px">
-      <div class="import-zone" onclick="createNewPlaylist()" style="flex:1;margin-bottom:0;padding:14px">
-        <div class="import-label" style="font-size:12px">+ New Playlist</div>
-      </div>
-      <div class="import-zone" onclick="$('file-input').click()" style="flex:1;margin-bottom:0;padding:14px">
-        <div class="import-label" style="font-size:12px">Import CSV</div>
-        <input type="file" id="file-input" accept=".csv,.json" multiple style="display:none">
-      </div>
-      <div class="import-zone" onclick="importSpotifyPlaylist()" style="flex:1;margin-bottom:0;padding:14px;border-color:#1DB954">
-        <div class="import-label" style="font-size:12px;color:#1DB954">Import Spotify</div>
-      </div>
-    </div>`;
-
-  if (!allPls.length) {
-    html += `<div class="state-msg" style="padding:20px 0"><div class="state-icon">&#x2261;</div><div class="state-title">No playlists</div><div class="state-sub">Create one or import from Exportify</div></div>`;
+  if (!allPlaylists.length) {
+    html += `<section class="library-empty"><div class="state-icon">&#x2261;</div><h2>Start your library</h2><p>Make a playlist for songs you love, or import a CSV/JSON export to keep your collection together.</p><button class="home-now-button primary" type="button" onclick="createNewPlaylist()">Create playlist</button></section>`;
   } else {
-    html += `<div class="playlist-list">`;
-    allPls.forEach(pl => {
-      const cached = pl.tracks.filter(t => t.ytId).length;
-      const isLiked = pl.isLiked;
-      html += `<div class="playlist-item" onclick="renderPlaylistDetail('${pl.id}')">
-        <div class="pl-art">${isLiked ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-heart-fill"/></svg>' : '&#x2261;'}</div>
-        <div class="pl-info">
-          <div class="pl-name">${esc(pl.name)}${isLiked ? ' <span style="font-size:10px;color:var(--text-tertiary)">· ' + likedIds.size + ' liked</span>' : ''}</div>
-          <div class="pl-meta">${pl.trackCount} track${pl.trackCount!==1?'s':''} · ${cached} cached${isLiked ? ' · auto' : ''}</div>
-        </div>
-        <div class="pl-actions">
-          ${isLiked ? '' : `<button class="pl-btn" onclick="event.stopPropagation();shufflePl('${pl.id}', event)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:4px"><use href="#icon-shuffle"/></svg> Shuffle</button>`}
-          ${isLiked ? '' : `<button class="pl-btn-del" onclick="event.stopPropagation();delPl('${pl.id}')" title="Remove"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-x"/></svg></button>`}
-        </div>
-      </div>`;
+    html += `<section class="library-playlists"><div class="library-section-heading"><span>Playlists</span><span>${allPlaylists.length}</span></div><div class="playlist-grid">`;
+    allPlaylists.forEach(playlist => {
+      const cached = playlist.tracks.filter(track => track.ytId).length;
+      const isLiked = playlist.isLiked;
+      const thumb = playlist.tracks.find(track => track.ytId)?.ytId;
+      const art = isLiked
+        ? '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-heart-fill"/></svg>'
+        : thumb ? `<img src="${esc(getYtThumb(thumb))}" alt="" loading="lazy">` : '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>';
+      html += `<article class="playlist-card" onclick="renderPlaylistDetail('${playlist.id}')"><div class="playlist-card-art${isLiked ? ' liked' : ''}">${art}</div><div class="playlist-card-copy"><h2>${esc(playlist.name)}</h2><p>${playlist.trackCount} track${playlist.trackCount === 1 ? '' : 's'} · ${cached} resolved${isLiked ? ' · Auto-saved' : ''}</p></div><div class="playlist-card-actions">${isLiked ? '' : `<button class="pl-btn" type="button" onclick="event.stopPropagation();shufflePl('${playlist.id}', event)">Shuffle</button><button class="pl-btn-del" type="button" onclick="event.stopPropagation();delPl('${playlist.id}')" title="Remove playlist" aria-label="Remove ${esc(playlist.name)}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><use href="#icon-x"/></svg></button>`}</div></article>`;
     });
-    html += `</div>`;
+    html += `</div></section>`;
   }
-  html += `</div>`;
-  $('content').innerHTML = html;
-  const fi = $('file-input');
-  if (fi) { fi.addEventListener('change', function() { if (this.files?.length) handleFiles(this.files); this.value = ''; }); }
+  $('content').innerHTML = html + `</section>`;
+  const fileInput = $('file-input');
+  if (fileInput) fileInput.addEventListener('change', function() { if (this.files?.length) handleFiles(this.files); this.value = ''; });
 }
 
 // ── PROMPT MODAL (replaces native prompt() — broken in Electron) ──
-function showPrompt(title, placeholder, callback) {
+function showPrompt(options, callback) {
   const overlay = $('prompt-overlay');
   const input = $('prompt-input');
+  const eyebrow = $('prompt-eyebrow');
   const titleEl = $('prompt-title');
+  const description = $('prompt-description');
+  const error = $('prompt-error');
   const okBtn = $('prompt-ok');
   const cancelBtn = $('prompt-cancel');
+  const {
+    eyebrow: eyebrowText = 'Tuneless',
+    title,
+    description: descriptionText = '',
+    placeholder = '',
+    actionLabel = 'Continue',
+    inputType = 'text',
+    validate = () => '',
+  } = options;
 
+  eyebrow.textContent = eyebrowText;
   titleEl.textContent = title;
+  description.textContent = descriptionText;
   input.value = '';
-  input.placeholder = placeholder || '';
+  input.type = inputType;
+  input.placeholder = placeholder;
+  input.removeAttribute('aria-invalid');
+  error.textContent = '';
+  okBtn.textContent = actionLabel;
   overlay.style.display = 'flex';
   setTimeout(() => input.focus(), 50);
 
-  function close(result) {
+  function close(confirmed, value = '') {
     overlay.style.display = 'none';
     okBtn.removeEventListener('click', onOk);
     cancelBtn.removeEventListener('click', onCancel);
     input.removeEventListener('keydown', onKey);
-    callback(result);
+    overlay.removeEventListener('click', onBackdrop);
+    if (confirmed) callback(value);
   }
-  function onOk() { close(input.value); }
-  function onCancel() { close(null); }
-  function onKey(e) { if (e.key === 'Enter') close(input.value); if (e.key === 'Escape') close(null); }
+  function onOk() {
+    const value = input.value.trim();
+    const message = validate(value);
+    if (message) {
+      error.textContent = message;
+      input.setAttribute('aria-invalid', 'true');
+      input.focus();
+      return;
+    }
+    close(true, value);
+  }
+  function onCancel() { close(false); }
+  function onKey(event) {
+    if (event.key === 'Enter') { event.preventDefault(); onOk(); }
+    if (event.key === 'Escape') { event.preventDefault(); close(false); }
+  }
+  function onBackdrop(event) { if (event.target === overlay) close(false); }
 
   okBtn.addEventListener('click', onOk);
   cancelBtn.addEventListener('click', onCancel);
   input.addEventListener('keydown', onKey);
+  overlay.addEventListener('click', onBackdrop);
 }
 
 function createNewPlaylist() {
-  showPrompt('Playlist name:', 'My Playlist', async (name) => {
-    if (!name || !name.trim()) return;
-    const pl = { id: 'pl_'+Date.now()+'_'+Math.random().toString(36).slice(2), name: name.trim(), trackCount: 0, tracks: [] };
-    playlists.unshift(pl); savePls(); renderLibrary(); toast('Created "' + name.trim() + '"');
+  showPrompt({
+    eyebrow: 'Your library',
+    title: 'Create a playlist',
+    description: 'Give this collection a name. You can add songs anytime.',
+    placeholder: 'e.g. Late night drives',
+    actionLabel: 'Create playlist',
+    validate: name => name ? '' : 'Enter a name for your playlist.',
+  }, async name => {
+    const pl = { id: 'pl_'+Date.now()+'_'+Math.random().toString(36).slice(2), name, trackCount: 0, tracks: [] };
+    playlists.unshift(pl); savePls(); renderLibrary(); toast('Created "' + name + '"');
     syncPlaylistToCloud(pl);
   });
 }
@@ -899,7 +943,11 @@ function showAddToPlaylistMenu() {
   const okBtn = $('prompt-ok');
   const cancelBtn = $('prompt-cancel');
 
-  titleEl.textContent = 'Add to playlist:';
+  $('prompt-eyebrow').textContent = 'Your library';
+  titleEl.textContent = 'Add to playlist';
+  $('prompt-description').textContent = 'Choose where to save the current track.';
+  $('prompt-error').textContent = '';
+  okBtn.textContent = 'Add';
   // Replace the text input with a select dropdown
   input.style.display = 'none';
   let select = document.getElementById('prompt-select');
@@ -937,10 +985,24 @@ function showAddToPlaylistMenu() {
 function renderQueue() {
   if (tab !== 'queue') return;
   if (!queue.length) {
-    $('content').innerHTML = `<div class="state-msg"><div class="state-icon">&#x25B6;</div><div class="state-title">Queue is empty</div><div class="state-sub">Search songs or shuffle a playlist</div></div>`;
+    $('content').innerHTML = `<section class="queue-page"><header class="queue-page-header"><div><div class="page-kicker">Your listening session</div><h1 class="page-title">Queue</h1><p class="page-description">Keep the music moving with songs from search, playlists, and Play Next.</p></div></header><div class="state-msg queue-empty"><div class="state-icon">&#x25B6;</div><div class="state-title">Your queue is empty</div><div class="state-sub">Search for a track or start a playlist to build what plays next.</div></div></section>`;
     return;
   }
-  $('content').innerHTML = `<div class="section-header"><span class="section-title">Up Next (${queue.length})</span><button class="section-action" onclick="clearQ()">Clear</button></div><div class="track-list">${queue.map((r,i) => trackHtml(r,i,'queue')).join('')}</div>`;
+
+  const current = currentIdx >= 0 ? queue[currentIdx] : null;
+  const priorityIds = new Set(_playNextIds);
+  const priority = _playNextIds
+    .map(id => queue.find(track => track.id === id))
+    .filter(track => track && track !== current);
+  const upcoming = queue.filter((track, index) => (shuffleOn ? index !== currentIdx : index > currentIdx) && !priorityIds.has(track.id));
+  const upcomingCount = priority.length + upcoming.length;
+  const shuffleLabel = shuffleOn ? 'Shuffle on' : 'In queue order';
+  let html = `<section class="queue-page"><header class="queue-page-header"><div><div class="page-kicker">Your listening session</div><h1 class="page-title">Queue</h1><p class="page-description">${upcomingCount ? `${upcomingCount} track${upcomingCount === 1 ? '' : 's'} coming up` : 'Nothing else is lined up'} · ${shuffleLabel}</p></div><button class="queue-clear-button" type="button" onclick="clearUpcomingQueue()">Clear upcoming</button></header>`;
+  if (current) html += `<section class="queue-section queue-now"><div class="queue-section-heading"><span>Now playing</span><span class="queue-section-note">Current track</span></div><div class="track-list">${trackHtml(current, currentIdx, 'queue')}</div></section>`;
+  if (priority.length) html += `<section class="queue-section queue-priority"><div class="queue-section-heading"><span>Playing next</span><span class="queue-section-note">${priority.length} priority ${priority.length === 1 ? 'track' : 'tracks'}</span></div><div class="track-list">${priority.map(track => trackHtml(track, queue.indexOf(track), 'queue')).join('')}</div></section>`;
+  if (upcoming.length) html += `<section class="queue-section"><div class="queue-section-heading"><span>${priority.length ? 'Then' : 'Up next'}</span><span class="queue-section-note">${shuffleOn ? 'Shuffle chooses the next track' : 'Queue order'}</span></div><div class="track-list">${upcoming.map(track => trackHtml(track, queue.indexOf(track), 'queue')).join('')}</div></section>`;
+  if (!upcomingCount && current) html += `<div class="queue-finish-note">This queue ends after the current track. Add more music to keep listening.</div>`;
+  $('content').innerHTML = html + `</section>`;
 }
 
 function renderSettings() {
@@ -949,112 +1011,111 @@ function renderSettings() {
   const initials = currentUser?.email ? currentUser.email.slice(0, 2).toUpperCase() : '';
   const displayName = currentUser?.user_metadata?.full_name || currentUser?.email?.split('@')[0] || '';
 
-  let html = `<div style="padding:24px;max-width:500px">`;
+  $('content').innerHTML = `<div class="settings-page">
+    <header class="settings-heading">
+      <div class="settings-eyebrow">Tuneless</div>
+      <h1 class="settings-title">Playback & settings</h1>
+      <p class="settings-lede">Everything needed to keep listening, recover from YouTube errors, and manage downloaded audio.</p>
+    </header>
 
-  // Account section
-  {
-    html += `<div class="account-card">
-      <div class="account-header">
-        <div class="account-avatar">${isLoggedIn ? esc(initials) : '?'}</div>
-        <div style="flex:1">
-          <div class="account-name">${isLoggedIn ? esc(displayName) : 'Not signed in'}</div>
-          <div class="account-email">${isLoggedIn ? esc(currentUser.email) : 'Sign in to sync across devices'}</div>
-        </div>
+    <section class="settings-section">
+      <div class="settings-section-title">Playback health</div>
+      <div class="health-grid">
+        <article class="health-card" id="cookies-health-card">
+          <div class="health-card-top"><span class="health-card-label">YouTube access</span><span class="status-pill warning" id="cookies-health-pill">Checking</span></div>
+          <div class="health-card-value" id="cookies-status">Checking cookies…</div>
+          <p class="health-card-copy">Import a current cookies.txt only if YouTube asks you to sign in or confirms you are not a bot.</p>
+          <div class="health-card-actions"><button class="settings-button primary" onclick="importCookies()">Import cookies</button><button class="settings-button danger" id="cookies-remove-btn" style="display:none" onclick="removeCookies()">Remove</button></div>
+        </article>
+        <article class="health-card">
+          <div class="health-card-top"><span class="health-card-label">Audio cache</span><span class="status-pill" id="cache-health-pill">Checking</span></div>
+          <div class="health-card-value" id="cache-status">Checking downloaded audio…</div>
+          <p class="health-card-copy">Completed downloads play instantly and do not require another YouTube request.</p>
+          <div class="health-card-actions"><button class="settings-button" onclick="refreshPlaybackHealth()">Refresh</button><button class="settings-button danger" onclick="clearAudioCache()">Clear downloads</button></div>
+        </article>
+        <article class="health-card wide">
+          <div class="health-card-top"><span class="health-card-label">Extractor</span><span class="status-pill" id="ytdlp-health-pill">Checking</span></div>
+          <div class="health-card-value" id="ytdlp-version">Checking yt-dlp…</div>
+          <p class="health-card-copy">yt-dlp downloads complete audio files locally before the player serves them. Run the health check if playback fails.</p>
+          <div class="health-card-actions"><button class="settings-button" onclick="refreshPlaybackHealth()">Refresh status</button><button class="settings-button primary" onclick="runDiagnostics()">Run health check</button></div>
+          <pre class="diagnostic-output" id="diag-results"></pre>
+        </article>
       </div>
-      <div class="sync-status" id="sync-status"><span class="sync-dot ${syncStatus === 'synced' ? 'synced' : syncStatus === 'syncing' ? 'syncing' : 'logged-out'}"></span> ${isLoggedIn ? esc(syncStatus) : 'Offline mode'}</div>
-      ${isLoggedIn
-        ? `<button class="setup-btn" style="margin-top:8px;background:transparent;color:var(--text-secondary);border:1px solid var(--border)" onclick="handleAuthSignOut()">Sign Out</button>`
-        : `<button class="setup-btn" style="margin-top:8px" onclick="showAuthOverlay()">Sign In / Sign Up</button>`
-      }
-    </div>`;
-  }
+    </section>
 
-  html += `${API_KEY ? '' : '<div style="background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:12px 16px;margin-bottom:16px;font-size:12px;color:var(--text-secondary)">Set your YouTube API key to enable search and playback.</div>'}`
-
-  // YouTube API Key
-  html += `<div style="margin-bottom:24px">
-      <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">YouTube API Key</div>
-      <input type="text" id="sett-key" class="setup-input" value="${esc(API_KEY)}" placeholder="AIza..." autocomplete="off" spellcheck="false">
-      <button class="setup-btn" style="margin-top:8px" onclick="updateKey()">${API_KEY ? 'Update' : 'Save'}</button>
-      ${API_KEY ? `<div style="margin-top:8px;font-size:11px;color:var(--text-tertiary)">● ${API_KEY.slice(0,12)}...</div>` : ''}
-    </div>`;
-
-  // Audio settings
-  html += `<div style="margin-bottom:24px">
-      <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">Audio</div>
-      <div style="display:flex;align-items:center;gap:12px">
-        <span style="font-size:12px;color:var(--text-secondary);min-width:80px">Crossfade</span>
-        <input type="range" id="crossfade-slider" min="0" max="10" step="1" value="${crossfadeSec}"
-          style="flex:1;-webkit-appearance:none;appearance:none;height:3px;background:var(--border);border-radius:2px;outline:none;cursor:pointer">
-        <span id="crossfade-label" style="font-size:12px;color:var(--text-secondary);min-width:40px">${crossfadeSec}s</span>
+    <section class="settings-section">
+      <div class="settings-section-title">Audio</div>
+      <div class="health-grid">
+        <article class="health-card wide">
+          <div class="health-card-label">Crossfade</div>
+          <div class="settings-range"><span class="health-card-value" style="margin:0">${crossfadeSec}s</span><input id="crossfade-slider" type="range" min="0" max="10" step="1" value="${crossfadeSec}" aria-label="Crossfade duration"><span class="status-pill" id="crossfade-label">${crossfadeSec}s</span></div>
+          <p class="health-card-copy">Controls the transition delay between tracks. Set to 0 seconds for immediate transitions.</p>
+        </article>
+        <article class="health-card wide">
+          <div class="health-card-top"><span class="health-card-label">Up next preloading</span><span class="status-pill ${upcomingPreloadLimit ? 'good' : ''}">${upcomingPreloadLimit ? upcomingPreloadLimit + ' tracks' : 'Off'}</span></div>
+          <div class="health-card-value">${upcomingPreloadLimit ? 'Preparing the next ' + upcomingPreloadLimit + ' tracks' : 'Preloading is disabled'}</div>
+          <p class="health-card-copy">Downloads upcoming songs in the background after playback begins. This reduces transition time but uses network data and local storage.</p>
+          <div class="health-card-actions"><button class="settings-button ${upcomingPreloadLimit === 0 ? 'primary' : ''}" onclick="setUpcomingPreloadLimit(0)">Off</button><button class="settings-button ${upcomingPreloadLimit === 1 ? 'primary' : ''}" onclick="setUpcomingPreloadLimit(1)">1 track</button><button class="settings-button ${upcomingPreloadLimit === 2 ? 'primary' : ''}" onclick="setUpcomingPreloadLimit(2)">2 tracks</button><button class="settings-button ${upcomingPreloadLimit === 3 ? 'primary' : ''}" onclick="setUpcomingPreloadLimit(3)">3 tracks</button></div>
+        </article>
+        <article class="health-card wide">
+          <div class="health-card-label">Sleep timer</div>
+          <div class="health-card-actions">${[15,30,45,60,90,120].map(m => `<button class="settings-button" onclick="setSleepTimer(${m})">${m >= 60 ? (m / 60) + 'h' : m + 'm'}</button>`).join('')}<button class="settings-button danger" onclick="cancelSleepTimer()">Turn off</button></div>
+          <p class="health-card-copy" id="sleep-timer-status">No sleep timer is active.</p>
+        </article>
       </div>
-    </div>`;
+    </section>
 
-  // Sleep Timer
-  html += `<div style="margin-bottom:24px">
-      <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">Sleep Timer</div>
-      <div style="display:flex;gap:6px;flex-wrap:wrap">
-        ${[15,30,45,60,90,120].map(m => `<button class="pl-btn" onclick="setSleepTimer(${m})" style="padding:6px 12px">${m >= 60 ? (m/60) + 'h' : m + 'm'}</button>`).join('')}
-        <button class="pl-btn" onclick="cancelSleepTimer()" style="padding:6px 12px;border-color:#ef4444;color:#ef4444">Off</button>
+    <section class="settings-section">
+      <div class="settings-section-title">Search & account</div>
+      <div class="health-grid">
+        <article class="health-card wide">
+          <div class="health-card-top"><span class="health-card-label">YouTube Data API</span><span class="status-pill ${API_KEY ? 'good' : 'warning'}">${API_KEY ? 'Configured' : 'Required'}</span></div>
+          <div class="settings-field"><input type="text" id="sett-key" class="setup-input" value="${esc(API_KEY)}" placeholder="AIza…" autocomplete="off" spellcheck="false" aria-label="YouTube Data API key"><button class="settings-button primary" onclick="updateKey()">${API_KEY ? 'Update' : 'Save'}</button></div>
+          <p class="health-card-copy">Required for search and resolving playlist tracks. ${API_KEY ? 'Current key: ' + esc(API_KEY.slice(0, 12)) + '…' : 'No key configured.'}</p>
+        </article>
+        <article class="health-card wide">
+          <div class="health-card-top"><span class="health-card-label">Cloud sync</span><span class="status-pill ${isLoggedIn ? 'good' : ''}">${isLoggedIn ? 'Connected' : 'Local only'}</span></div>
+          <div class="health-card-value">${isLoggedIn ? esc(displayName || currentUser.email) : 'Not signed in'}</div>
+          <p class="health-card-copy">${isLoggedIn ? 'Sync status: ' + esc(syncStatus) + '.' : 'Sign in to sync playlists and likes across devices.'}</p>
+          <div class="health-card-actions">${isLoggedIn ? '<button class="settings-button danger" onclick="handleAuthSignOut()">Sign out</button>' : '<button class="settings-button primary" onclick="showAuthOverlay()">Sign in / sign up</button>'}</div>
+        </article>
       </div>
-      <div id="sleep-timer-status" style="font-size:11px;color:var(--text-muted);margin-top:8px;display:none"></div>
-    </div>`;
+    </section>
 
-  // Shortcuts
-  html += `<div>
-      <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">Shortcuts</div>
-      <div style="font-size:12px;color:var(--text-secondary);line-height:2.2">
-        <kbd class="kb">Space</kbd> Play/Pause &middot; <kbd class="kb">M</kbd> Mute &middot; <kbd class="kb">L</kbd> Like<br>
-        <kbd class="kb">&rarr;</kbd> Next &middot; <kbd class="kb">&larr;</kbd> Prev &middot; <kbd class="kb">&uarr;&darr;</kbd> Volume<br>
-        <kbd class="kb">S</kbd> Shuffle &middot; <kbd class="kb">R</kbd> Repeat &middot; <kbd class="kb">F</kbd> Full player<br>
-        <kbd class="kb">1</kbd>-<kbd class="kb">9</kbd> Seek 10%-90% &middot; <kbd class="kb">0</kbd> End<br>
-        <kbd class="kb">&#x2318;K</kbd> Search &middot; <kbd class="kb">Esc</kbd> Close overlay
+    <section class="settings-section">
+      <div class="settings-section-title">Keyboard shortcuts</div>
+      <div class="health-card wide settings-shortcuts">
+        <span><kbd class="kb">Space</kbd> Play or pause &middot; <kbd class="kb">M</kbd> Mute</span>
+        <span><kbd class="kb">←</kbd> Previous &middot; <kbd class="kb">→</kbd> Next</span>
+        <span><kbd class="kb">S</kbd> Shuffle &middot; <kbd class="kb">R</kbd> Repeat</span>
+        <span><kbd class="kb">F</kbd> Full player &middot; <kbd class="kb">L</kbd> Like</span>
       </div>
-    </div>`;
-
-  // Cookies
-  html += `<div style="margin-top:24px">
-      <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">YouTube Cookies</div>
-      <div style="font-size:12px;color:var(--text-secondary);line-height:1.7;margin-bottom:10px">
-        YouTube sometimes blocks playback ("Sign in to confirm you're not a bot").
-        Fix it by exporting a cookies.txt from your browser (Get cookies.txt LOCALLY extension) and importing it here.
-      </div>
-      <div id="cookies-status" style="font-size:12px;color:var(--text-tertiary);margin-bottom:10px">Checking...</div>
-      <button class="setup-btn" style="margin-bottom:8px" onclick="importCookies()">Import cookies.txt</button>
-      <button class="setup-btn" id="cookies-remove-btn" style="display:none;background:transparent;color:var(--text-tertiary);border:1px solid var(--border)" onclick="removeCookies()">Remove cookies</button>
-    </div>`;
-
-  // Diagnostics
-  html += `<div style="margin-top:24px">
-      <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">Diagnostics</div>
-      <button class="setup-btn" style="margin-bottom:8px" onclick="runDiagnostics()">Test Audio Pipeline</button>
-      <div id="diag-results" style="font-size:12px;color:var(--text-secondary);line-height:1.8;background:var(--surface);padding:12px;border-radius:4px;border:1px solid var(--border);white-space:pre-wrap;font-family:monospace;max-height:300px;overflow-y:auto"></div>
-    </div>`;
-
-  // About
-  html += `<div style="margin-top:24px">
-      <div style="font-size:11px;color:var(--text-tertiary);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px">About</div>
-      <div style="font-size:13px;color:var(--text-secondary);line-height:1.8">
-        Tuneless &mdash; desktop music player.<br>
-        Algorithmic recommendations &middot; yt-dlp audio &middot; v2.0.8
-      </div>
-    </div>
+    </section>
   </div>`;
-  $('content').innerHTML = html;
+
   const cfSlider = $('crossfade-slider');
-  if (cfSlider) {
-    cfSlider.addEventListener('input', () => {
-      crossfadeSec = parseFloat(cfSlider.value);
-      $('crossfade-label').textContent = crossfadeSec + 's';
-      localStorage.setItem('tl_crossfade', crossfadeSec.toString());
-    });
-  }
-  // Show cookie status
+  if (cfSlider) cfSlider.addEventListener('input', () => {
+    crossfadeSec = parseFloat(cfSlider.value);
+    $('crossfade-label').textContent = crossfadeSec + 's';
+    localStorage.setItem('tl_crossfade', crossfadeSec.toString());
+  });
   updateCookiesStatus();
+  refreshPlaybackHealth();
+  updateSleepTimerUI();
+}
+
+function backToLibrary() {
+  currentPlaylistId = null;
+  _plFilter = '';
+  renderLibrary();
+  renderSidebar();
 }
 
 function renderPlaylistDetail(plId) {
+  tab = 'library';
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.tab === 'library'));
   currentPlaylistId = plId;
+  renderSidebar();
   const isLiked = plId === '__liked';
   const pl = isLiked ? getLikedPlaylist() : playlists.find(p => p.id === plId);
   if (!pl) { renderLibrary(); return; }
@@ -1064,23 +1125,11 @@ function renderPlaylistDetail(plId) {
     ? pl.tracks.filter(t => t.name.toLowerCase().includes(_plFilter) || t.artist.toLowerCase().includes(_plFilter))
     : pl.tracks;
 
-  let html = `<div class="pl-det-head">
-      <button class="back-btn" onclick="renderLibrary();currentPlaylistId=null;_plFilter=''"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-arrow-left"/></svg></button>
-      <div style="flex:1;min-width:0">
-        <div style="font-size:14px;font-weight:600">${esc(pl.name)}</div>
-        <div style="font-size:11px;color:var(--text-tertiary);margin-top:2px">${pl.trackCount} tracks · ${cached} cached · ${filtered.length} shown</div>
-      </div>
-      <div class="pl-action-group">
-        <button class="pl-play-btn" id="pl-play-btn" onclick="playPl('${plId}', event)" title="Play"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="6 3 20 12 6 21 6 3"/></svg></button>
-        <button class="pl-shuffle-toggle${shuffleOn ? ' active' : ''}" id="pl-shuffle-toggle" onclick="toggleShuffleFromPlaylist('${plId}', event)" title="Shuffle"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-shuffle"/></svg></button>
-      </div>
-    </div>
-    <div style="padding:8px 24px;border-bottom:1px solid var(--border)">
-      <input type="text" id="pl-filter" placeholder="Filter ${pl.trackCount} tracks..." autocomplete="off" spellcheck="false"
-        style="width:100%;padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:inherit;font-size:13px;outline:none"
-        value="${esc(_plFilter)}">
-    </div>
-    <div class="track-list" id="pl-tracks"></div>`;
+  const artTrack = pl.tracks.find(track => track.ytId);
+  const art = artTrack?.ytId
+    ? `<img src="${esc(getYtThumb(artTrack.ytId))}" alt="" loading="lazy">`
+    : isLiked ? '<svg width="30" height="30" viewBox="0 0 24 24" fill="currentColor"><use href="#icon-heart-fill"/></svg>' : '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>';
+  let html = `<section class="playlist-detail-page"><button class="playlist-back" type="button" onclick="backToLibrary()"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-arrow-left"/></svg> Library</button><header class="playlist-detail-header"><div class="playlist-detail-art${isLiked ? ' liked' : ''}">${art}</div><div class="playlist-detail-copy"><div class="page-kicker">${isLiked ? 'Your saved tracks' : 'Playlist'}</div><h1>${esc(pl.name)}</h1><p id="pl-detail-meta">${pl.trackCount} track${pl.trackCount === 1 ? '' : 's'} · ${cached} resolved · ${filtered.length} shown</p></div><div class="pl-action-group"><button class="pl-play-btn" id="pl-play-btn" type="button" onclick="playPl('${plId}', event)" title="Play playlist" aria-label="Play ${esc(pl.name)}"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="6 3 20 12 6 21 6 3"/></svg><span>Play</span></button><button class="pl-shuffle-toggle${shuffleOn ? ' active' : ''}" id="pl-shuffle-toggle" type="button" onclick="toggleShuffleFromPlaylist('${plId}', event)" title="Toggle shuffle" aria-label="Toggle shuffle"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-shuffle"/></svg></button></div></header><div class="playlist-filter-wrap"><label for="pl-filter">Filter tracks</label><input type="text" id="pl-filter" placeholder="Search ${pl.trackCount} tracks" autocomplete="off" spellcheck="false" value="${esc(_plFilter)}"></div><div class="playlist-tracks-heading"><span>Tracks</span><span>${isLiked ? 'Saved to your library' : 'Drag to reorder'}</span></div><div class="playlist-tracks" id="pl-tracks"></div></section>`;
 
   $('content').innerHTML = html;
   renderPlaylistTracks(pl, plId, filtered);
@@ -1096,8 +1145,8 @@ function renderPlaylistDetail(plId) {
         : pl.tracks;
       renderPlaylistTracks(pl, plId, newFiltered);
       // Update the count in the header
-      const header = $('content').querySelector('.pl-det-head .pl-info div:last-child');
-      if (header) header.textContent = `${pl.trackCount} tracks · ${cached} cached · ${newFiltered.length} shown`;
+      const meta = $('pl-detail-meta');
+      if (meta) meta.textContent = `${pl.trackCount} track${pl.trackCount === 1 ? '' : 's'} · ${cached} resolved · ${newFiltered.length} shown`;
     });
   }
 }
@@ -1107,28 +1156,14 @@ function renderPlaylistTracks(pl, plId, filtered) {
   if (!el) return;
   const isLiked = plId === '__liked';
   if (!filtered.length) {
-    el.innerHTML = `<div class="state-msg" style="padding:40px"><div class="state-icon">&#x25CB;</div><div class="state-title">${_plFilter ? 'No matching tracks' : 'No tracks'}</div><div class="state-sub">${_plFilter ? 'Try a different search term' : 'This playlist is empty'}</div></div>`;
+    el.innerHTML = `<div class="playlist-tracks-empty"><div class="state-icon">&#x25CB;</div><div class="state-title">${_plFilter ? 'No matching tracks' : 'No tracks yet'}</div><div class="state-sub">${_plFilter ? 'Try another title or artist.' : 'Add tracks to start this playlist.'}</div></div>`;
   } else {
-    el.innerHTML = filtered.map((t, i) => {
-      const isCurrentlyPlaying = queue[currentIdx]?.id === (t.ytId || '');
-      const thumb = t.ytId ? getYtThumb(t.ytId) : '';
-      const realIdx = pl.tracks.indexOf(t);
-      return `<div class="track-item${isCurrentlyPlaying ? ' playing' : ''}"
-        draggable="${!isLiked}"
-        ondragstart="_dragIdx=${realIdx};this.style.opacity='0.4'"
-        ondragend="this.style.opacity='1'"
-        ondragover="event.preventDefault();this.style.borderTop='2px solid var(--accent)'"
-        ondragleave="this.style.borderTop=''"
-        ondrop="event.preventDefault();this.style.borderTop='';reorderTrack('${plId}',_dragIdx,${realIdx})"
-        onclick="playPlaylistTrack('${plId}', ${realIdx})">
-        ${!isLiked ? '<div style="display:flex;align-items:center;color:var(--text-muted);cursor:grab;padding-right:4px;font-size:10px">⠿</div>' : ''}
-        <div class="track-thumb">${thumb ? `<img src="${thumb}" loading="lazy">` : ''}</div>
-        <div class="track-info">
-          <div class="track-title">${esc(t.name)}${isCurrentlyPlaying ? ' <span style="color:var(--text-tertiary)">&#x25CF; playing</span>' : ''}</div>
-          <div class="track-artist">${esc(normalizeArtist(t.artist) || 'Unknown')}</div>
-        </div>
-        <div style="flex-shrink:0;display:flex;align-items:center;color:var(--text-tertiary)">${t.ytId ? '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-check"/></svg>' : '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-refresh"/></svg>'}</div>
-      </div>`;
+    el.innerHTML = filtered.map(track => {
+      const isCurrentlyPlaying = queue[currentIdx]?.id === (track.ytId || '');
+      const thumb = track.ytId ? getYtThumb(track.ytId) : '';
+      const realIdx = pl.tracks.indexOf(track);
+      const status = isCurrentlyPlaying ? '<span class="playlist-track-status playing">Playing</span>' : track.ytId ? '<span class="playlist-track-status ready">Ready</span>' : '<span class="playlist-track-status">Will resolve</span>';
+      return `<div class="playlist-track${isCurrentlyPlaying ? ' playing' : ''}" draggable="${!isLiked}" ondragstart="_dragIdx=${realIdx};this.classList.add('dragging')" ondragend="this.classList.remove('dragging')" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="event.preventDefault();this.classList.remove('drag-over');reorderTrack('${plId}',_dragIdx,${realIdx})" onclick="playPlaylistTrack('${plId}', ${realIdx})"><span class="playlist-track-order">${!isLiked ? '<span class="playlist-drag-handle" title="Drag to reorder">⠿</span>' : realIdx + 1}</span><div class="track-thumb">${thumb ? `<img src="${esc(thumb)}" loading="lazy" alt="">` : ''}</div><div class="track-info"><div class="track-title">${esc(track.name)}</div><div class="track-artist">${esc(normalizeArtist(track.artist) || 'Unknown')}</div></div>${status}</div>`;
     }).join('');
   }
 }
@@ -1175,46 +1210,116 @@ function trackHtml(r, i, ctx) {
   const playing = queue[currentIdx]?.id === r.id;
   const thumb = r.thumb || getYtThumb(r.id);
   const titleAttr = 'title' in r ? r.title : r.name;
-  return `<div class="track-item${playing?' playing':''}">
-    <div style="display:flex;align-items:center;gap:14px;flex:1;min-width:0;cursor:pointer" onclick="${ctx==='queue' ? 'playFromQ('+i+')' : 'playSearch('+i+')'}">
-    <div class="track-thumb">${thumb ? `<img src="${esc(thumb)}" loading="lazy">` : ''}</div>
-    <div class="track-info">
-      <div class="track-title">${esc(r.title||r.name)}${isStreamLoading && playing ? ' <span style="color:var(--text-tertiary)">loading...</span>' : ''}</div>
-      <div class="track-artist">${esc(normalizeArtist(r.artist)||'')}</div>
-    </div>
-    <div class="track-dur">${r.duration||''}</div>
-    </div>
-    <div style="flex-shrink:0;display:flex;gap:4px">
-      <button class="pc-btn" onclick="playNextSearch(${i})" title="Play next" style="font-size:0;width:26px;height:26px"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-plus"/></svg></button>
-      <button class="pc-btn" onclick="addToQueueEnd('${esc(titleAttr)}','${esc(r.artist||'')}','${r.id}')" title="Add to queue" style="font-size:0;width:26px;height:26px"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-plus"/></svg></button>
+  const isSearch = ctx === 'search';
+  const queued = queue.some(track => track.id === r.id);
+  const queuedNext = _playNextIds.includes(r.id);
+  const status = isSearch && (playing || queued)
+    ? `<span class="track-status${queuedNext ? ' next' : ''}">${playing ? 'Playing' : queuedNext ? 'Playing next' : 'In queue'}</span>`
+    : '';
+  const primaryAction = `<button class="pc-btn pc-btn-next${queuedNext ? ' active' : ''}" onclick="event.stopPropagation();${ctx==='queue' ? 'playNextQueue('+i+')' : 'playNextSearch('+i+')'}" title="${queuedNext ? 'Already set to play next' : queued ? 'Move to Play Next' : 'Play next'}" aria-label="${queuedNext ? 'Already set to play next' : 'Play ' + esc(titleAttr) + ' next'}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 4 15 12 5 20 5 4"/><line x1="19" y1="5" x2="19" y2="19"/></svg><span class="pc-btn-label">${queuedNext ? 'Next' : 'Play next'}</span></button>`;
+  const secondaryAction = ctx === 'queue'
+    ? `<button class="pc-btn pc-btn-remove" onclick="event.stopPropagation();removeQueueTrack(${i})" title="Remove from queue" aria-label="Remove ${esc(titleAttr)} from queue"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/></svg><span class="pc-btn-label">Remove</span></button>`
+    : `<button class="pc-btn" onclick="event.stopPropagation();addSearchToQueue(${i})" title="${queued ? 'Already in queue' : 'Add to queue'}" aria-label="Add ${esc(titleAttr)} to queue"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-plus"/></svg><span class="pc-btn-label">Add</span></button>`;
+  return `<div class="track-item${playing?' playing':''}${isSearch ? ' search-track-item' : ''}">
+    <button class="track-main" type="button" onclick="${ctx==='queue' ? 'playFromQ('+i+')' : 'playSearch('+i+')'}" aria-label="Play ${esc(titleAttr)}">
+      <div class="track-thumb">${thumb ? `<img src="${esc(thumb)}" loading="lazy" alt="">` : ''}</div>
+      <div class="track-info">
+        <div class="track-title">${esc(r.title||r.name)}${isStreamLoading && playing ? ' <span class="track-loading">Loading</span>' : ''}</div>
+        <div class="track-artist">${esc(normalizeArtist(r.artist)||'')}</div>
+      </div>
+      ${status}
+      <div class="track-dur">${r.duration||''}</div>
+    </button>
+    <div class="track-actions${isSearch ? ' track-actions-visible' : ''}">
+      ${primaryAction}
+      ${secondaryAction}
     </div>
   </div>`;
 }
 
 // Queue management
 function playNextSearch(i) {
-  const s = searchResults[i]; if (!s) return;
-  const existing = queue.findIndex(q => q.id === s.id);
-  if (existing >= 0) { toast('Already in queue'); return; }
-  const song = { id: s.id, title: s.title, artist: s.artist, thumb: s.thumb || getYtThumb(s.id), duration: s.duration || '' };
+  const result = searchResults[i];
+  if (!result) return;
+  promoteToPlayNext(result, queue.findIndex(track => track.id === result.id));
+}
+
+function playNextQueue(i) {
+  const song = queue[i];
+  if (!song) return;
+  promoteToPlayNext(song, i);
+}
+
+function promoteToPlayNext(source, existing) {
+  if (existing === currentIdx) { toast('"' + trunc(source.title, 30) + '" is already playing'); return; }
+  if (_playNextIds.includes(source.id)) { toast('"' + trunc(source.title, 30) + '" is already set to play next'); return; }
+
+  let song;
+  if (existing >= 0) {
+    // A queue is a library of upcoming tracks; Play Next is a priority request.
+    // Promote the existing entry instead of rejecting it or creating a duplicate.
+    [song] = queue.splice(existing, 1);
+    if (existing < currentIdx) currentIdx--;
+  } else {
+    song = { id: source.id, title: source.title, artist: source.artist, thumb: source.thumb || getYtThumb(source.id), duration: source.duration || '' };
+  }
+
   if (currentIdx >= 0 && currentIdx < queue.length) {
-    queue.splice(currentIdx + 1, 0, song);
+    // Keep multiple Play Next selections in click order, even when shuffle is on.
+    queue.splice(currentIdx + 1 + _playNextIds.length, 0, song);
   } else {
     queue.push(song);
   }
-  toast('"' + trunc(s.title, 30) + '" will play next');
+  _playNextIds.push(song.id);
+  toast('"' + trunc(source.title, 30) + '" will play next');
   saveSession();
+  if (!audio.paused) preloadUpcomingTracks(_playRequestId);
   if (tab === 'queue') renderQueue();
+  if (tab === 'search') renderSearch();
 }
 
-function addToQueueEnd(title, artist, id) {
-  const existing = queue.findIndex(q => q.id === id);
-  if (existing >= 0) { toast('Already in queue'); return; }
-  const song = { id, title, artist, thumb: getYtThumb(id), duration: '' };
-  queue.push(song);
+function addSearchToQueue(i) {
+  const result = searchResults[i];
+  if (!result) return;
+  if (queue.some(track => track.id === result.id)) { toast('Already in queue'); return; }
+  queue.push({
+    id: result.id,
+    title: result.title,
+    artist: result.artist,
+    thumb: result.thumb || getYtThumb(result.id),
+    duration: result.duration || '',
+  });
   toast('Added to queue');
   saveSession();
   if (tab === 'queue') renderQueue();
+  if (tab === 'search') renderSearch();
+}
+
+function removeQueueTrack(i) {
+  if (i < 0 || i >= queue.length) return;
+  if (i === currentIdx) { toast('The current track cannot be removed'); return; }
+  const [removed] = queue.splice(i, 1);
+  if (i < currentIdx) currentIdx--;
+  _playNextIds = _playNextIds.filter(id => id !== removed.id);
+  _failedTrackIds.delete(removed.id);
+  toast('Removed from queue');
+  saveSession();
+  if (tab === 'queue') renderQueue();
+  if (tab === 'search') renderSearch();
+}
+
+function clearUpcomingQueue() {
+  if (currentIdx < 0 || !queue[currentIdx]) { clearQ(); return; }
+  const current = queue[currentIdx];
+  queue = [current];
+  currentIdx = 0;
+  _playNextIds = [];
+  _failedTrackIds = new Set(_failedTrackIds.has(current.id) ? [current.id] : []);
+  trackHistory = [];
+  toast('Cleared upcoming tracks');
+  saveSession();
+  if (tab === 'queue') renderQueue();
+  if (tab === 'search') renderSearch();
 }
 
 // ── PLAY ─────────────────────────────────────────────────────────────────
@@ -1228,61 +1333,108 @@ function playFromQ(i) { currentIdx = i; playIndex(i, true); renderQueue(); saveS
 
 async function playIndex(idx, manual) {
   if (idx < 0 || idx >= queue.length) return;
+  const requestId = ++_playRequestId;
+  cancelPendingAdvance();
   clearStallTimer(); _stallRetries = 0; _hasPlayedData = false;
   const song = queue[idx]; if (!song) return;
 
-  // Crossfade: only on auto-advance (song ending), NOT on manual skip
-  // Skip when muted so we never restore stale volume
-  if (!manual && crossfadeSec > 0 && !isMuted && audio.src && !audio.paused) {
-    const fadeDuration = Math.min(crossfadeSec, 1.5); // cap at 1.5s even for auto
-    const fadeSteps = 8;
-    const fadeInterval = (fadeDuration * 1000) / fadeSteps;
-    const startVol = audio.volume;
-    for (let i = fadeSteps; i >= 0; i--) {
-      audio.volume = startVol * (i / fadeSteps);
-      await new Promise(r => setTimeout(r, fadeInterval));
-    }
-  } else if (audio.src && !audio.paused) {
-    // Manual skip: cut instantly
-    audio.volume = 0;
-  }
-  audio.volume = isMuted ? 0 : currentVol;
+  // Selecting a track explicitly gives it another chance after a transient failure.
+  if (manual) _failedTrackIds.delete(song.id);
+  _playNextIds = _playNextIds.filter(id => id !== song.id);
 
+  if (audio.src) {
+    audio.pause();
+    audio.removeAttribute('src');
+    audio.load();
+  }
+  _fallbackUrl = null; _primaryUrl = null; _usingFallback = false;
   currentIdx = idx; updateNowPlaying(song); setPlayerLoading(true);
+  if (tab === 'search') renderSearch();
   addToRecentlyPlayed(song);
+
   try {
     const urls = await window.tuneless.playStream(song.id);
-    if (urls?.error) {
-      console.error('[playIndex] stream error:', urls.error);
-      setPlayerLoading(false);
-      _fallbackUrl = null; _primaryUrl = null;
-      const isBot = /bot-check|cookies/i.test(urls.error);
-      if (isBot) {
-        toast('YouTube blocked this track — import cookies.txt in Settings to fix');
-      } else {
-        toast('Could not get audio stream: ' + urls.error);
-      }
-      // Skip to next track instead of redirecting away from current view
-      if (queue.length > 1) {
-        setTimeout(() => nextTrack(), 1500);
-      }
+    if (requestId !== _playRequestId) return;
+    if (!urls?.primary) {
+      handleTrackFailure(requestId, urls?.error || 'Could not get audio stream');
       return;
     }
-    if (!urls || !urls.primary) { toast('Could not get audio stream'); setPlayerLoading(false); return; }
     _primaryUrl = urls.primary;
     _fallbackUrl = urls.fallback;
-    _usingFallback = false;
     console.log('[playIndex] setting src:', _primaryUrl);
     audio.src = _primaryUrl;
-    // Wait for the audio element to have enough data before playing
     await audio.play();
+    if (requestId !== _playRequestId) return;
     toast('▶ ' + trunc(song.title, 50));
+    preloadUpcomingTracks(requestId);
   } catch (e) {
-    console.error('play error:', e);
+    if (requestId !== _playRequestId) return;
     if (e.name === 'NotAllowedError') { setPlayerLoading(false); toast('Click play to start'); }
-    else { toast('Failed to play: ' + (e.message || 'unknown')); setPlayerLoading(false); }
+    else handleTrackFailure(requestId, e.message || 'Failed to play');
+  } finally {
+    if (requestId === _playRequestId) saveSession();
   }
-  saveSession();
+}
+
+function handleTrackFailure(requestId, message) {
+  if (requestId !== _playRequestId || !queue[currentIdx]) return;
+  const song = queue[currentIdx];
+  _fallbackUrl = null; _primaryUrl = null; _usingFallback = false;
+  setPlayerLoading(false);
+  console.error('[player] track failed:', song.id, message);
+  const isBot = /bot-check|cookies|not a bot|sign in to confirm/i.test(message);
+  if (isBot) {
+    // This is an account-wide YouTube challenge, not a bad track. Do not burn
+    // through the queue or mark every song as unavailable.
+    showPlaybackAlert(
+      'YouTube needs authentication',
+      'Import your browser cookies to resume playback and cache future tracks.',
+      'Import cookies',
+      openCookiesSetup,
+    );
+    return;
+  }
+  _failedTrackIds.add(song.id);
+  toast('Track unavailable — skipping');
+  if (hasNextTrack()) scheduleAdvance(700, requestId);
+}
+
+function hasNextTrack() {
+  if (_playNextIds.some(id => queue.some(track => track.id === id && !_failedTrackIds.has(id)))) return true;
+  if (shuffleOn) return queue.some((track, index) => index !== currentIdx && !_failedTrackIds.has(track.id));
+  return queue.slice(currentIdx + 1).some(track => !_failedTrackIds.has(track.id)) || repeatMode === 'all';
+}
+
+function setUpcomingPreloadLimit(limit) {
+  upcomingPreloadLimit = Math.max(0, Math.min(3, Number(limit) || 0));
+  localStorage.setItem('tl_preload_limit', upcomingPreloadLimit.toString());
+  toast(upcomingPreloadLimit ? `Preloading ${upcomingPreloadLimit} upcoming track${upcomingPreloadLimit === 1 ? '' : 's'}` : 'Upcoming preloading off');
+  if (!audio.paused) preloadUpcomingTracks(_playRequestId);
+  if (tab === 'settings') renderSettings();
+}
+
+function preloadUpcomingTracks(requestId) {
+  if (!upcomingPreloadLimit || !window.tuneless?.preloadStream || requestId !== _playRequestId) return;
+  const priority = _playNextIds
+    .map(id => queue.find(track => track.id === id))
+    .filter(Boolean);
+  const remaining = queue
+    .map((track, index) => ({ track, index }))
+    .filter(({ track, index }) => index !== currentIdx && !_failedTrackIds.has(track.id));
+  const candidates = shuffleOn
+    ? [...priority, ...remaining.sort(() => Math.random() - 0.5).map(({ track }) => track)]
+    : [...priority, ...remaining.filter(({ index }) => index > currentIdx).map(({ track }) => track)];
+  const ids = [...new Set(candidates.map(track => track.id))].slice(0, upcomingPreloadLimit);
+
+  // Download one at a time. It improves the next transition without competing
+  // with foreground playback or creating a burst of YouTube requests.
+  (async () => {
+    for (const id of ids) {
+      if (requestId !== _playRequestId) return;
+      const result = await window.tuneless.preloadStream(id);
+      if (!result?.ok) console.warn('[preload] unavailable:', id, result?.error);
+    }
+  })();
 }
 
 function togglePlay() {
@@ -1306,26 +1458,70 @@ function togglePlay() {
   }
 }
 
-function nextTrack() {
+// Track history for proper previous navigation
+let trackHistory = [];
+
+function nextTrack({ automatic = false } = {}) {
   if (!queue.length) return;
-  let next;
-  if (shuffleOn && queue.length > 1) {
-    // Pick a random track that isn't the current one
-    do { next = Math.floor(Math.random() * queue.length); } while (next === currentIdx);
-  } else {
-    next = currentIdx + 1;
-    if (next >= queue.length) { if (repeatMode === 'all') next = 0; else return; }
+  cancelPendingAdvance();
+
+  // Play Next is a user promise: it always wins over shuffle.
+  let next = -1;
+  while (_playNextIds.length && next < 0) {
+    const id = _playNextIds.shift();
+    const index = queue.findIndex(track => track.id === id);
+    if (index >= 0 && !_failedTrackIds.has(id)) next = index;
   }
-  playIndex(next, true); if (tab === 'queue') renderQueue();
+
+  if (next < 0 && shuffleOn) {
+    const candidates = queue
+      .map((track, index) => ({ track, index }))
+      .filter(({ track, index }) => index !== currentIdx && !_failedTrackIds.has(track.id));
+    if (!candidates.length) return;
+    next = candidates[Math.floor(Math.random() * candidates.length)].index;
+  }
+
+  if (next < 0) {
+    for (let index = currentIdx + 1; index < queue.length; index++) {
+      if (!_failedTrackIds.has(queue[index].id)) { next = index; break; }
+    }
+    if (next < 0 && repeatMode === 'all') {
+      next = queue.findIndex(track => !_failedTrackIds.has(track.id));
+    }
+  }
+
+  if (next >= 0) {
+    if (currentIdx >= 0 && currentIdx !== next) {
+      trackHistory.push(currentIdx);
+      if (trackHistory.length > 50) trackHistory.shift();
+    }
+    playIndex(next, !automatic);
+    if (tab === 'queue') renderQueue();
+  }
 }
 
 function prevTrack() {
   if (!queue.length) return;
   if (audio.currentTime > 3) { audio.currentTime = 0; return; }
+
+  // Check if we have previous tracks in history
+  if (trackHistory.length > 0) {
+    // Go to the most recent track from history
+    const prevIdx = trackHistory.pop();
+    if (prevIdx >= 0 && prevIdx < queue.length) {
+      playIndex(prevIdx, true);
+      if (tab === 'queue') renderQueue();
+      return;
+    }
+  }
+
+  // Fallback to normal previous behavior
   let prev = currentIdx - 1;
   if (prev < 0) { if (repeatMode === 'all') prev = queue.length - 1; else return; }
-  playIndex(prev, true); if (tab === 'queue') renderQueue();
+  playIndex(prev, true);
+  if (tab === 'queue') renderQueue();
 }
+
 
 function toggleShuffle() {
   shuffleOn = !shuffleOn;
@@ -1357,12 +1553,22 @@ function toggleRepeat() {
   toast('Repeat: ' + repeatMode);
 }
 
-function seekTo(e) { const rect = e.currentTarget.getBoundingClientRect(); if (audio.duration) audio.currentTime = ((e.clientX - rect.left) / rect.width) * audio.duration; }
+function seekTo(e) {
+  console.log('seekTo called, audio duration:', audio.duration, 'currentTime:', audio.currentTime);
+  const rect = e.currentTarget.getBoundingClientRect();
+  if (audio.duration) {
+    const newTime = ((e.clientX - rect.left) / rect.width) * audio.duration;
+    console.log('Setting currentTime to:', newTime);
+    audio.currentTime = newTime;
+  }
+}
 function fpSeek(e) { const rect = e.currentTarget.getBoundingClientRect(); if (audio.duration) audio.currentTime = ((e.clientX - rect.left) / rect.width) * audio.duration; }
 
 function clearQ() {
-  queue = []; currentIdx = -1; audio.pause(); audio.src = '';
+  ++_playRequestId; cancelPendingAdvance();
+  queue = []; currentIdx = -1; audio.pause(); audio.removeAttribute('src'); audio.load();
   _fallbackUrl = null; _primaryUrl = null; _usingFallback = false;
+  trackHistory = []; _playNextIds = []; _failedTrackIds.clear();
   $('progress-fill').style.width = '0%';
   $('player-bar').style.display = 'none'; if (tab === 'queue') renderQueue(); closeFullPlayer();
   saveSession();
@@ -1382,14 +1588,21 @@ function fpToggleQueue() {
 
 function updateFullPlayerQueue() {
   if (!queue.length) { $('fp-q-count').textContent = ''; $('fp-queue-list').innerHTML = ''; return; }
-  $('fp-q-count').textContent = queue.length + ' tracks';
-  $('fp-queue-list').innerHTML = queue.map((t, i) => {
-    const playing = i === currentIdx; const thumb = t.thumb || getYtThumb(t.id);
-    return `<div class="fp-queue-item${playing?' playing':''}" onclick="closeFullPlayer();playFromQ(${i})">
-      <div class="fp-qi-thumb">${thumb ? `<img src="${thumb}" loading="lazy">` : ''}</div>
-      <div class="fp-qi-info"><div class="fp-qi-title">${esc(t.title||t.name)}</div><div class="fp-qi-artist">${esc(normalizeArtist(t.artist)||'')}</div></div>
-    </div>`;
-  }).join('');
+  const current = currentIdx >= 0 ? queue[currentIdx] : null;
+  const priorityIds = new Set(_playNextIds);
+  const priority = _playNextIds.map(id => queue.find(track => track.id === id)).filter(track => track && track !== current);
+  const upcoming = queue.filter((track, index) => (shuffleOn ? index !== currentIdx : index > currentIdx) && !priorityIds.has(track.id));
+  const item = (track, className = '') => {
+    const index = queue.indexOf(track);
+    const thumb = track.thumb || getYtThumb(track.id);
+    return `<div class="fp-queue-item${index === currentIdx ? ' playing' : ''}${className ? ' ' + className : ''}" onclick="closeFullPlayer();playFromQ(${index})"><div class="fp-qi-thumb">${thumb ? `<img src="${esc(thumb)}" loading="lazy" alt="">` : ''}</div><div class="fp-qi-info"><div class="fp-qi-title">${esc(track.title || track.name)}</div><div class="fp-qi-artist">${esc(normalizeArtist(track.artist) || '')}</div></div></div>`;
+  };
+  const count = priority.length + upcoming.length;
+  $('fp-q-count').textContent = count ? `${count} coming up` : 'Queue ends here';
+  let html = current ? `<div class="fp-queue-label">Now playing</div>${item(current)}` : '';
+  if (priority.length) html += `<div class="fp-queue-label">Playing next</div>${priority.map(track => item(track, 'priority')).join('')}`;
+  if (upcoming.length) html += `<div class="fp-queue-label">${priority.length ? 'Then' : 'Up next'}</div>${upcoming.map(track => item(track)).join('')}`;
+  $('fp-queue-list').innerHTML = html;
 }
 
 // ── PROGRESS ─────────────────────────────────────────────────────────────
@@ -1473,7 +1686,10 @@ async function playPl(plId, evt) {
     saveCache(); savePls();
     if (resolvedCount > 0) toast(`+${resolvedCount} tracks cached`);
   }
-  if (btn) { btn.classList.remove('loading'); setIcon(btn, isPlaying ? 'pause' : 'play', 20); }
+  if (btn) {
+    btn.classList.remove('loading');
+    btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="6 3 20 12 6 21 6 3"/></svg><span>Play</span>`;
+  }
 }
 
 async function shufflePl(plId, evt) {
@@ -1551,12 +1767,15 @@ function delPl(id) {
 // ── FILE HANDLER ─────────────────────────────────────────────────────────
 // ── SPOTIFY IMPORT ──────────────────────────────────────────────────────
 async function importSpotifyPlaylist() {
-  // Show a prompt for the Spotify playlist URL
-  showPrompt('Spotify Playlist URL:', 'https://open.spotify.com/playlist/...', async (url) => {
-    if (!url || !url.includes('spotify.com/playlist/')) {
-      toast('Please enter a valid Spotify playlist URL');
-      return;
-    }
+  showPrompt({
+    eyebrow: 'Import music',
+    title: 'Import a Spotify playlist',
+    description: 'Paste a public Spotify playlist URL. Your tracks will be added to your local library.',
+    placeholder: 'https://open.spotify.com/playlist/...',
+    actionLabel: 'Import playlist',
+    inputType: 'url',
+    validate: url => url.includes('spotify.com/playlist/') ? '' : 'Enter a valid Spotify playlist URL.',
+  }, async url => {
     // Try to use stored credentials, or ask for them
     let clientId = localStorage.getItem('tl_spotify_client_id') || '';
     let clientSecret = localStorage.getItem('tl_spotify_client_secret') || '';
@@ -1781,22 +2000,70 @@ async function saveSupabaseConfig() {
 
 // ── DIAGNOSTICS ────────────────────────────────────────────────────────────
 // ── COOKIES (YouTube bot-check bypass) ─────────────────────────────────
+function setStatusPill(id, text, state = '') {
+  const pill = $(id);
+  if (!pill) return;
+  pill.textContent = text;
+  pill.className = 'status-pill' + (state ? ' ' + state : '');
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  return (bytes / (1024 ** index)).toFixed(index ? 1 : 0) + ' ' + units[index];
+}
+
 async function updateCookiesStatus() {
   const el = $('cookies-status');
   if (!el) return;
   try {
     const s = await window.tuneless.cookiesStatus();
     if (s?.present) {
-      el.innerHTML = '<span style="color:#1DB954">●</span> cookies.txt active — streams use it';
+      el.textContent = 'Browser cookies active';
+      setStatusPill('cookies-health-pill', 'Active', 'good');
       const btn = $('cookies-remove-btn');
-      if (btn) btn.style.display = 'block';
+      if (btn) btn.style.display = 'inline-block';
     } else {
-      el.innerHTML = '<span style="color:var(--text-quaternary)">○</span> No cookies.txt yet — import one if YouTube blocks playback';
+      el.textContent = 'No browser cookies imported';
+      setStatusPill('cookies-health-pill', 'Optional', 'warning');
       const btn = $('cookies-remove-btn');
       if (btn) btn.style.display = 'none';
     }
   } catch (e) {
-    el.textContent = 'Status unavailable: ' + e.message;
+    el.textContent = 'Cookie status unavailable';
+    setStatusPill('cookies-health-pill', 'Unavailable', 'warning');
+  }
+}
+
+async function refreshPlaybackHealth() {
+  const cacheEl = $('cache-status');
+  const versionEl = $('ytdlp-version');
+  try {
+    const [cache, version] = await Promise.all([
+      window.tuneless.cacheStatus(),
+      window.tuneless.ytdlpVersion(),
+    ]);
+    if (cacheEl) cacheEl.textContent = `${cache.files} ${cache.files === 1 ? 'track' : 'tracks'} · ${formatBytes(cache.bytes)}`;
+    setStatusPill('cache-health-pill', cache.files ? 'Ready' : 'Empty', cache.files ? 'good' : '');
+    if (versionEl) versionEl.textContent = version.startsWith('ERROR:') ? 'yt-dlp unavailable' : 'yt-dlp ' + version;
+    setStatusPill('ytdlp-health-pill', version.startsWith('ERROR:') ? 'Unavailable' : 'Ready', version.startsWith('ERROR:') ? 'warning' : 'good');
+  } catch (e) {
+    if (cacheEl) cacheEl.textContent = 'Cache status unavailable';
+    if (versionEl) versionEl.textContent = 'yt-dlp status unavailable';
+    setStatusPill('cache-health-pill', 'Unavailable', 'warning');
+    setStatusPill('ytdlp-health-pill', 'Unavailable', 'warning');
+  }
+}
+
+async function clearAudioCache() {
+  try {
+    const result = await window.tuneless.cacheClear();
+    if (!result?.ok) throw new Error(result?.message || 'Could not clear downloaded audio');
+    toast('Downloaded audio cleared');
+    refreshPlaybackHealth();
+  } catch (e) {
+    toast('Could not clear downloads: ' + e.message);
   }
 }
 
@@ -1804,6 +2071,7 @@ async function importCookies() {
   try {
     const r = await window.tuneless.cookiesImport();
     toast(r?.ok ? r.message : (r?.message || 'Import failed'));
+    if (r?.ok) dismissPlaybackAlert();
     updateCookiesStatus();
   } catch (e) {
     toast('Import failed: ' + e.message);
@@ -1821,6 +2089,7 @@ async function removeCookies() {
 }
 
 function openCookiesSetup() {
+  dismissPlaybackAlert();
   switchTab('settings');
   const el = $('cookies-status');
   if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -1828,47 +2097,30 @@ function openCookiesSetup() {
 
 async function runDiagnostics() {
   const el = $('diag-results');
-  el.textContent = 'Running diagnostics...\n';
+  if (!el) return;
+  el.classList.add('visible');
+  el.textContent = 'Running playback health check…\n';
+  const lines = [];
   try {
-    // 1. Check yt-dlp version
-    el.textContent += '\n1. Checking yt-dlp... ';
-    const ver = await window.tuneless.ytdlpVersion();
-    el.textContent += ver + '\n';
-  } catch (e) {
-    el.textContent += 'ERROR: ' + e.message + '\n';
-  }
-  try {
-    // 2. Try to resolve a test video
-    el.textContent += '\n2. Testing stream extraction (Rick Astley)...\n';
+    const version = await window.tuneless.ytdlpVersion();
+    lines.push(`yt-dlp: ${version}`);
     const result = await window.tuneless.ytdlpTest('dQw4w9WgXcQ');
-    el.textContent += '   Primary URL: ' + (result.primary ? result.primary.slice(0,80) + '...' : 'FAILED') + '\n';
-    el.textContent += '   Fallback URL: ' + (result.fallback ? result.fallback.slice(0,80) + '...' : 'FAILED') + '\n';
-    el.textContent += '   Last resort: ' + (result.lastResort ? result.lastResort.slice(0,80) + '...' : 'FAILED') + '\n';
-    if (result.error) el.textContent += '   Errors: ' + result.error + '\n';
-    if (result.primary) el.textContent += '\n✅ yt-dlp works! Stream URLs extracted.\n';
-    else el.textContent += '\n❌ yt-dlp failed to extract any stream.\n';
+    if (result.success) lines.push(`Extraction: passed (${formatBytes(result.bytes)} downloaded in ${result.time}s)`);
+    else lines.push(`Extraction: failed — ${result.error || 'unknown error'}`);
   } catch (e) {
-    el.textContent += '   ERROR: ' + e.message + '\n';
+    lines.push(`Extractor check: failed — ${e.message}`);
   }
   try {
-    // 3. Test stream proxy
-    el.textContent += '\n3. Testing stream proxy... ';
-    const resp = await fetch('http://127.0.0.1:18762/stream/dQw4w9WgXcQ', { method: 'HEAD' });
-    el.textContent += 'HTTP ' + resp.status + ' ' + resp.statusText + '\n';
+    // A malformed route checks that the local server responds without causing a download.
+    const response = await fetch('http://127.0.0.1:18762/health', { method: 'HEAD' });
+    lines.push(`Local audio server: reachable (HTTP ${response.status})`);
   } catch (e) {
-    el.textContent += 'NOT REACHABLE: ' + e.message + '\n';
+    lines.push(`Local audio server: unavailable — ${e.message}`);
   }
-  try {
-    // 4. Check audio element support
-    el.textContent += '\n4. Audio element support:\n';
-    const a = document.createElement('audio');
-    el.textContent += '   canPlayType(aac/mp4): ' + (a.canPlayType('audio/mp4').replace('no', '❌').replace('maybe', '⚠️ maybe').replace('probably', '✅ probably')) + '\n';
-    el.textContent += '   canPlayType(mp3): ' + (a.canPlayType('audio/mpeg').replace('no', '❌').replace('maybe', '⚠��� maybe').replace('probably', '✅ probably')) + '\n';
-    el.textContent += '   canPlayType(ogg/opus): ' + (a.canPlayType('audio/ogg; codecs=opus').replace('no', '❌').replace('maybe', '⚠️ maybe').replace('probably', '✅ probably')) + '\n';
-    el.textContent += '   canPlayType(webm): ' + (a.canPlayType('audio/webm').replace('no', '❌').replace('maybe', '⚠️ maybe').replace('probably', '✅ probably')) + '\n';
-  } catch (e) {
-    el.textContent += '   ERROR: ' + e.message + '\n';
-  }
+  const audioProbe = document.createElement('audio');
+  lines.push(`Audio support: MP4 ${audioProbe.canPlayType('audio/mp4') || 'no'} · WebM ${audioProbe.canPlayType('audio/webm') || 'no'}`);
+  el.textContent = lines.join('\n');
+  refreshPlaybackHealth();
 }
 
 // ── TABS ─────────────────────────────────────────────────────────────────
@@ -1902,75 +2154,65 @@ function renderSidebar() {
 }
 
 // ── HOME SCREEN ──────────────────────────────────────────────────────────
+function openSearch() {
+  switchTab('search');
+  setTimeout(() => $('search-input')?.focus(), 0);
+}
+
 function renderHome() {
   const hour = new Date().getHours();
   const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
-  let html = '';
-  html += `<div class="home-greeting">${greeting}</div>`;
-  html += `<div class="home-title">Home</div>`;
-
-  // Jump Back In — last 6 recently played
+  const current = currentIdx >= 0 ? queue[currentIdx] : null;
   const jumpBack = recentlyPlayed.slice(0, 6);
+  const priorityIds = new Set(_playNextIds);
+  const priority = _playNextIds.map(id => queue.find(track => track.id === id)).filter(track => track && track !== current);
+  const remaining = queue.filter((track, index) => (shuffleOn ? index !== currentIdx : index > currentIdx) && !priorityIds.has(track.id));
+  const upNext = [...priority, ...remaining].slice(0, 5);
+  let html = `<div class="home-page"><header class="home-header"><div><div class="page-kicker">Your music, your way</div><h1 class="home-title">${greeting}</h1><p class="home-subtitle">Pick up where you left off or find something new.</p></div><button class="home-search-button" type="button" onclick="openSearch()"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> Search music</button></header>`;
+
+  if (current) {
+    const thumb = current.thumb || getYtThumb(current.id);
+    html += `<section class="home-now"><div class="home-now-art">${thumb ? `<img src="${esc(thumb)}" alt="" loading="lazy">` : ''}</div><div class="home-now-copy"><div class="home-now-kicker">${isPlaying ? 'Now playing' : 'Paused'}</div><div class="home-now-title">${esc(current.title)}</div><div class="home-now-artist">${esc(normalizeArtist(current.artist))}</div></div><div class="home-now-actions"><button class="home-now-button primary" type="button" onclick="togglePlay()">${isPlaying ? 'Pause' : 'Play'}</button><button class="home-now-button" type="button" onclick="openFullPlayer()">Open player</button></div></section>`;
+  }
+
   if (jumpBack.length) {
-    html += `<div class="section-header"><span class="section-title">Jump back in</span></div>`;
-    html += `<div class="home-cards">`;
-    jumpBack.forEach((t, i) => {
-      const thumb = t.thumb || getYtThumb(t.id);
-      html += `<div class="home-card" onclick="replayRecents(${i})">
-        <div class="home-card-img"><img src="${esc(thumb)}" loading="lazy"><div class="home-card-gradient"></div>
-        <button class="home-card-play" onclick="event.stopPropagation();replayRecents(${i})"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg></button></div>
-        <div class="home-card-info"><div class="home-card-title">${esc(t.title)}</div><div class="home-card-sub">${esc(normalizeArtist(t.artist))}</div></div>
+    html += `<section class="home-section"><div class="section-header"><div><div class="section-title">Jump back in</div><div class="section-description">Recent favorites and familiar tracks</div></div></div><div class="home-cards">`;
+    jumpBack.forEach((track, index) => {
+      const thumb = track.thumb || getYtThumb(track.id);
+      html += `<div class="home-card" onclick="replayRecents(${index})">
+        <div class="home-card-img"><img src="${esc(thumb)}" alt="" loading="lazy"><div class="home-card-gradient"></div>
+        <button class="home-card-play" type="button" onclick="event.stopPropagation();replayRecents(${index})" aria-label="Play ${esc(track.title)}"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg></button></div>
+        <div class="home-card-info"><div class="home-card-title">${esc(track.title)}</div><div class="home-card-sub">${esc(normalizeArtist(track.artist))}</div></div>
       </div>`;
     });
-    html += `</div>`;
+    html += `</div></section>`;
   }
 
-  // Up Next — queue preview
-  if (queue.length > currentIdx + 1) {
-    const nextTracks = queue.slice(currentIdx + 1, currentIdx + 9);
-    html += `<div class="section-header"><span class="section-title">Up Next</span><button class="section-action" onclick="switchTab('queue')">See all</button></div>`;
-    html += `<div class="up-next-list">`;
-    nextTracks.forEach((t, i) => {
-      const thumb = t.thumb || getYtThumb(t.id);
-      const dotClass = t._rec ? 'green' : 'gray';
-      html += `<div class="up-next-row" onclick="playFromQ(${currentIdx + 1 + i})">
-        <div class="up-next-thumb"><img src="${esc(thumb)}" loading="lazy"></div>
-        <div class="up-next-info"><div class="up-next-title">${esc(t.title)}</div><div class="up-next-artist">${esc(normalizeArtist(t.artist))}</div></div>
-        <div class="up-next-dot ${dotClass}"></div>
-      </div>`;
+  if (upNext.length) {
+    html += `<section class="home-section home-queue-preview"><div class="section-header"><div><div class="section-title">Coming up</div><div class="section-description">${priority.length ? 'Your Play Next picks are protected, even in shuffle.' : shuffleOn ? 'Shuffle is choosing what comes next.' : 'In the order you added them.'}</div></div><button class="section-action" onclick="switchTab('queue')">Open queue</button></div><div class="up-next-list">`;
+    upNext.forEach(track => {
+      const queueIndex = queue.indexOf(track);
+      const thumb = track.thumb || getYtThumb(track.id);
+      const isPriority = priorityIds.has(track.id);
+      html += `<button class="up-next-row" type="button" onclick="playFromQ(${queueIndex})"><div class="up-next-thumb">${thumb ? `<img src="${esc(thumb)}" alt="" loading="lazy">` : ''}</div><div class="up-next-info"><div class="up-next-title">${esc(track.title)}</div><div class="up-next-artist">${esc(normalizeArtist(track.artist))}</div></div>${isPriority ? '<span class="up-next-status">Play next</span>' : '<span class="up-next-dot"></span>'}</button>`;
     });
-    html += `</div>`;
+    html += `</div></section>`;
   }
 
-  // Your Playlists
   if (playlists.length) {
-    html += `<div class="section-header"><span class="section-title">Your Playlists</span><button class="section-action" onclick="switchTab('library')">See all</button></div>`;
-    html += `<div class="home-cards">`;
-    playlists.slice(0, 6).forEach(p => {
-      const thumb = p.tracks[0]?.ytId ? getYtThumb(p.tracks[0].ytId) : '';
-      html += `<div class="home-card" onclick="renderPlaylistDetail('${p.id}')">
-        <div class="home-card-img">${thumb ? `<img src="${esc(thumb)}" loading="lazy">` : `<div style="display:flex;align-items:center;justify-content:center;width:100%;height:100%;font-size:48px;color:var(--text-muted)"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>`}<div class="home-card-gradient"></div></div>
-        <div class="home-card-info"><div class="home-card-title">${esc(p.name)}</div><div class="home-card-sub">${p.trackCount} tracks</div></div>
-      </div>`;
+    html += `<section class="home-section"><div class="section-header"><div><div class="section-title">Your playlists</div><div class="section-description">${playlists.length} saved playlist${playlists.length === 1 ? '' : 's'}</div></div><button class="section-action" onclick="switchTab('library')">View library</button></div><div class="home-cards">`;
+    playlists.slice(0, 6).forEach(playlist => {
+      const thumb = playlist.tracks[0]?.ytId ? getYtThumb(playlist.tracks[0].ytId) : '';
+      html += `<div class="home-card" onclick="renderPlaylistDetail('${playlist.id}')"><div class="home-card-img">${thumb ? `<img src="${esc(thumb)}" alt="" loading="lazy">` : `<div class="home-card-art-fallback"><svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>`}<div class="home-card-gradient"></div></div><div class="home-card-info"><div class="home-card-title">${esc(playlist.name)}</div><div class="home-card-sub">${playlist.trackCount} track${playlist.trackCount === 1 ? '' : 's'}</div></div></div>`;
     });
-    html += `</div>`;
+    html += `</div></section>`;
   }
 
-  // Recently Resolved
-  if (recentlyPlayed.length) {
-    html += `<div class="section-header"><span class="section-title">Recently Resolved</span></div>`;
-    html += `<div class="resolved-table"><div class="resolved-row header"><span class="resolved-cell">Track</span><span class="resolved-cell">Artist</span><span class="resolved-cell">Plays</span><span class="resolved-cell">Status</span></div>`;
-    recentlyPlayed.slice(0, 10).forEach(t => {
-      html += `<div class="resolved-row" onclick="replayRecents(${recentlyPlayed.indexOf(t)})"><span class="resolved-cell">${esc(t.title)}</span><span class="resolved-cell" style="color:var(--text-muted)">${esc(normalizeArtist(t.artist))}</span><span class="resolved-cell" style="color:var(--text-muted)">${t.playCount || 1}</span><span class="resolved-status"><span class="resolved-dot ok"></span> Resolved</span></div>`;
-    });
-    html += `</div>`;
+  if (!current && !jumpBack.length && !playlists.length) {
+    html += `<section class="home-welcome"><div class="state-icon">&#x266B;</div><h2>Make this space yours</h2><p>Search for a song, create a playlist, or import an existing library to start listening.</p><div class="home-welcome-actions"><button class="home-now-button primary" type="button" onclick="openSearch()">Search music</button><button class="home-now-button" type="button" onclick="switchTab('library')">Open library</button></div></section>`;
   }
 
-  if (!jumpBack?.length && !playlists.length && !recentlyPlayed.length) {
-    html += `<div class="state-msg" style="padding:60px 0"><div class="state-icon">&#x266B;</div><div class="state-title">Welcome to Tuneless</div><div class="state-sub">Search for a song to get started, or import a playlist from Spotify.</div></div>`;
-  }
-
-  $('content').innerHTML = html;
+  $('content').innerHTML = html + `</div>`;
 }
 
 // ── SLEEP TIMER ──────────────────────────────────────────────────────────
@@ -2002,13 +2244,11 @@ function updateSleepTimerUI() {
   const el = $('sleep-timer-status');
   if (!el) return;
   if (!sleepTimerEnd) {
-    el.textContent = '';
-    el.style.display = 'none';
+    el.textContent = 'No sleep timer is active.';
     return;
   }
   const remaining = Math.max(0, Math.ceil((sleepTimerEnd - Date.now()) / 60000));
-  el.style.display = 'block';
-  el.innerHTML = `⏱ Sleep in ${remaining}m <button onclick="cancelSleepTimer()" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:11px;text-decoration:underline;margin-left:4px">cancel</button>`;
+  el.textContent = `Playback will pause in ${remaining} minute${remaining === 1 ? '' : 's'}.`;
 }
 
 // ── UTILS ────────────────────────────────────────────────────────────────
@@ -2031,6 +2271,8 @@ function toggleSidebar() {
   const btn = sb.querySelector('.sidebar-toggle');
   if (btn) {
     const isCollapsed = sb.classList.contains('collapsed');
+    btn.title = isCollapsed ? 'Expand sidebar' : 'Collapse sidebar';
+    btn.setAttribute('aria-label', isCollapsed ? 'Expand sidebar' : 'Collapse sidebar');
     btn.innerHTML = isCollapsed
       ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>'
       : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>';
