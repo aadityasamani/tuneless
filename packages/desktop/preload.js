@@ -45,7 +45,9 @@ contextBridge.exposeInMainWorld('tuneless', {
   onRecovery: (callback) =>
     ipcRenderer.on('auth:recovery', (event, data) => callback(data)),
 
-  // Media key handlers
+  // Media controls. Global-shortcut events are retained only as a fallback
+  // when Chromium Media Session is unavailable in the renderer.
+  mediaSessionActive: () => ipcRenderer.send('media-session:active'),
   onMediaPlayPause: (callback) => ipcRenderer.on('media:play-pause', () => callback()),
   onMediaNext: (callback) => ipcRenderer.on('media:next', () => callback()),
   onMediaPrev: (callback) => ipcRenderer.on('media:prev', () => callback()),

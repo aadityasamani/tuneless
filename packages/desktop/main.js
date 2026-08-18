@@ -5,8 +5,9 @@ const https = require('https');
 const fs = require('fs');
 const { spawn, execFile } = require('child_process');
 
-// Register custom protocol BEFORE app is ready
+// Register custom protocol and Windows app identity BEFORE app is ready.
 app.setAsDefaultProtocolClient('tuneless');
+if (process.platform === 'win32') app.setAppUserModelId('com.tuneless.desktop');
 
 const YOUTUBE_API_BASE = 'https://www.googleapis.com/youtube/v3';
 const STREAM_PORT = 18762;
@@ -96,6 +97,27 @@ function serveAudioFile(req, res, filePath) {
 
 let mainWindow;
 let streamServer;
+let rendererMediaSessionActive = false;
+const mediaShortcutActions = [
+  ['MediaPlayPause', 'media:play-pause'],
+  ['MediaNextTrack', 'media:next'],
+  ['MediaPreviousTrack', 'media:prev'],
+  ['MediaStop', 'media:stop'],
+];
+
+function registerMediaShortcuts() {
+  for (const [accelerator, channel] of mediaShortcutActions) {
+    const registered = globalShortcut.register(accelerator, () => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel);
+    });
+    if (!registered) console.warn(`[media] could not register ${accelerator}`);
+  }
+}
+
+function unregisterMediaShortcuts() {
+  for (const [accelerator] of mediaShortcutActions) globalShortcut.unregister(accelerator);
+}
+
 // Shared by foreground playback and background preloading. A track may only
 // have one yt-dlp process writing its cache file at a time.
 const activeDownloads = new Map();
@@ -327,11 +349,10 @@ app.commandLine.appendSwitch('disable-gpu');
 app.commandLine.appendSwitch('disable-software-rasterizer');
 
 app.on('ready', () => {
-  // Register global media key shortcuts (for keyboards/headsets that don't use MediaSession)
-  globalShortcut.register('MediaPlayPause', () => { if (mainWindow) mainWindow.webContents.send('media:play-pause'); });
-  globalShortcut.register('MediaNextTrack', () => { if (mainWindow) mainWindow.webContents.send('media:next'); });
-  globalShortcut.register('MediaPreviousTrack', () => { if (mainWindow) mainWindow.webContents.send('media:prev'); });
-  globalShortcut.register('MediaStop', () => { if (mainWindow) mainWindow.webContents.send('media:stop'); });
+  // Use global shortcuts only until the renderer confirms that Chromium Media
+  // Session is available. Registering both paths makes one headset press race
+  // two independent play/pause handlers.
+  registerMediaShortcuts();
   try {
     startStreamServer();
   } catch (e) {
@@ -346,6 +367,16 @@ app.on('before-quit', () => {
   app.isQuitting = true;
   globalShortcut.unregisterAll();
   if (streamServer) streamServer.close();
+});
+
+// Chromium's Media Session is the authoritative controller for Bluetooth
+// headsets, lock-screen controls, and Windows media controls. Once it is live,
+// stop consuming the same physical keys through Electron's globalShortcut API.
+ipcMain.on('media-session:active', (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents || rendererMediaSessionActive) return;
+  rendererMediaSessionActive = true;
+  unregisterMediaShortcuts();
+  console.log('[media] using renderer Media Session controls');
 });
 
 // ── IPC: Diagnostics ─────────────────────────────────────────────

@@ -479,12 +479,14 @@ function bootApp() {
   renderSidebar();
   // Initialize Supabase auth (checks for existing session, shows auth if needed)
   initAuth();
-  // Media key handlers (from Electron globalShortcuts)
+  // Fallback for platforms where Chromium Media Session is unavailable.
+  // Once Media Session is registered, the main process unregisters these
+  // global shortcuts so a hardware button cannot execute twice.
   if (window.tuneless?.onMediaPlayPause) {
     window.tuneless.onMediaPlayPause(() => togglePlay());
     window.tuneless.onMediaNext(() => nextTrack());
     window.tuneless.onMediaPrev(() => prevTrack());
-    window.tuneless.onMediaStop(() => { audio.pause(); audio.currentTime = 0; });
+    window.tuneless.onMediaStop(() => stopFromMediaControl());
   }
 }
 
@@ -562,8 +564,13 @@ audio.addEventListener('seeking', () => {
 });
 audio.addEventListener('seeked', () => {
   console.log('Audio seeked to:', audio.currentTime, 'duration:', audio.duration);
+  publishMediaPosition();
 });
-audio.addEventListener('timeupdate', () => { _hasPlayedData = true; updateTimeDisplay(); clearStallTimer(); });
+audio.addEventListener('loadedmetadata', publishMediaPosition);
+audio.addEventListener('timeupdate', () => {
+  _hasPlayedData = true; updateTimeDisplay(); clearStallTimer();
+  if (Date.now() - _lastMediaPositionUpdate >= 1000) publishMediaPosition();
+});
 let _stallTimer = null;
 let _stallRetries = 0;
 let _hasPlayedData = false; // true once this track has produced audio
@@ -626,28 +633,95 @@ audio.addEventListener('error', async () => {
 
 // ── MEDIA SESSION ────────────────────────────────────────────────────────
 let _mediaSessionSetup = false;
+let _lastMediaPositionUpdate = 0;
+let _canPublishMediaPosition = true;
+function setMediaSessionAction(action, handler) {
+  try {
+    navigator.mediaSession.setActionHandler(action, handler);
+    return true;
+  } catch (error) {
+    console.warn(`[media] ${action} control is unavailable`, error);
+    return false;
+  }
+}
+
+function playFromMediaControl() {
+  if (audio.ended && audio.src) {
+    togglePlay();
+  } else if (audio.src && audio.paused) {
+    audio.play().catch(error => console.warn('[media] could not resume playback', error));
+  } else if (!audio.src && currentIdx >= 0 && queue.length) {
+    playIndex(currentIdx, true);
+  }
+}
+
+function pauseFromMediaControl() {
+  if (audio.src && !audio.paused) audio.pause();
+}
+
+function stopFromMediaControl() {
+  pauseFromMediaControl();
+  if (audio.src) audio.currentTime = 0;
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'none';
+}
+
+function publishMediaPosition() {
+  if (!_canPublishMediaPosition || !('mediaSession' in navigator) || !audio.src) return;
+  const duration = audio.duration;
+  if (!Number.isFinite(duration) || duration <= 0 || !Number.isFinite(audio.currentTime)) return;
+  try {
+    navigator.mediaSession.setPositionState({
+      duration,
+      position: Math.min(Math.max(audio.currentTime, 0), duration),
+      playbackRate: audio.playbackRate || 1,
+    });
+    _lastMediaPositionUpdate = Date.now();
+  } catch (error) {
+    // Position reporting is optional; metadata and controls remain available.
+    _canPublishMediaPosition = false;
+    console.debug('[media] could not publish position', error);
+  }
+}
+
+function getMediaArtwork(song) {
+  const source = song.thumb || getYtThumb(song.id);
+  // The API accepts an artwork URL without guessed dimensions. Search and
+  // playlist thumbnails arrive in multiple sizes, so declaring them all as
+  // 480×480 can cause Windows/Chromium to reject the image.
+  return source ? [{ src: source }] : [];
+}
+
 function setupMediaSession() {
-  if (!('mediaSession' in navigator)) return;
-  if (_mediaSessionSetup) return; // only register handlers once
-  _mediaSessionSetup = true;
-  navigator.mediaSession.setActionHandler('play', () => { if (audio.src) audio.play(); });
-  navigator.mediaSession.setActionHandler('pause', () => { if (audio.src) audio.pause(); });
-  navigator.mediaSession.setActionHandler('nexttrack', () => nextTrack());
-  navigator.mediaSession.setActionHandler('previoustrack', () => prevTrack());
-  navigator.mediaSession.setActionHandler('seekto', (e) => { if (e.seekTime && audio.duration) audio.currentTime = e.seekTime; });
-  navigator.mediaSession.setActionHandler('stop', () => { audio.pause(); audio.currentTime = 0; navigator.mediaSession.playbackState = 'none'; });
+  if (!('mediaSession' in navigator) || _mediaSessionSetup) return;
+
+  // Use explicit actions, not a generic toggle: an OS "pause" must never
+  // become a resume merely because another control event arrives nearby.
+  const playReady = setMediaSessionAction('play', playFromMediaControl);
+  const pauseReady = setMediaSessionAction('pause', pauseFromMediaControl);
+  setMediaSessionAction('nexttrack', () => nextTrack());
+  setMediaSessionAction('previoustrack', () => prevTrack());
+  setMediaSessionAction('seekto', (event) => {
+    if (Number.isFinite(event.seekTime) && Number.isFinite(audio.duration)) audio.currentTime = event.seekTime;
+  });
+  setMediaSessionAction('stop', stopFromMediaControl);
+
+  _mediaSessionSetup = playReady && pauseReady;
+  if (_mediaSessionSetup) window.tuneless?.mediaSessionActive?.();
 }
 
 function updateMediaSession(song) {
-  if (!('mediaSession' in navigator)) return;
+  if (!('mediaSession' in navigator) || !song) return;
   setupMediaSession(); // ensure handlers are registered (idempotent)
-  navigator.mediaSession.metadata = new MediaMetadata({
-    title: song.title || 'Unknown', artist: normalizeArtist(song.artist) || '', album: 'Tuneless',
-    artwork: song.thumb
-      ? [{ src: song.thumb, sizes: '480x480', type: 'image/jpeg' }]
-      : [{ src: getYtThumb(song.id), sizes: '480x480', type: 'image/jpeg' }],
-  });
-  navigator.mediaSession.playbackState = 'playing';
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: song.title || 'Unknown',
+      artist: normalizeArtist(song.artist) || 'Unknown artist',
+      album: 'Tuneless',
+      artwork: getMediaArtwork(song),
+    });
+  } catch (error) {
+    console.warn('[media] could not publish track metadata', error);
+  }
 }
 
 // ── SVG ICON HELPER ─────────────────────────────────────────────────────────
@@ -1348,7 +1422,7 @@ async function playIndex(idx, manual) {
     audio.load();
   }
   _fallbackUrl = null; _primaryUrl = null; _usingFallback = false;
-  currentIdx = idx; updateNowPlaying(song); setPlayerLoading(true);
+  currentIdx = idx; updateNowPlaying(song); updateMediaSession(song); setPlayerLoading(true);
   if (tab === 'search') renderSearch();
   addToRecentlyPlayed(song);
 
