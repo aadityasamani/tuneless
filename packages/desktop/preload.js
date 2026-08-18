@@ -7,10 +7,14 @@ contextBridge.exposeInMainWorld('tuneless', {
     ipcRenderer.invoke('resolve:track', { trackName, artist, apiKey }),
   playStream: (videoId) =>
     ipcRenderer.invoke('play:stream', { videoId }),
+  preloadStream: (videoId) =>
+    ipcRenderer.invoke('preload:stream', { videoId }),
 
   // Diagnostics
   ytdlpVersion: () => ipcRenderer.invoke('ytdlp:version'),
   ytdlpTest: (videoId) => ipcRenderer.invoke('ytdlp:test', { videoId }),
+  cacheStatus: () => ipcRenderer.invoke('cache:status'),
+  cacheClear: () => ipcRenderer.invoke('cache:clear'),
 
   // Cookies (YouTube bot-check bypass)
   cookiesStatus: () => ipcRenderer.invoke('cookies:status'),
