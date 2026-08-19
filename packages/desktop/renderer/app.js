@@ -624,10 +624,11 @@ function setPlayerLoading(on) {
     $('np-title').textContent = queue[currentIdx].title;
     $('np-artist').textContent = 'Loading stream...';
     $('fp-artist').textContent = 'Loading stream...';
-    $('player-time').textContent = '⋯ / ⋯';
-    $('player-time').classList.add('loading');
+    $('np-current-time').textContent = '⋯';
+    $('np-total-time').textContent = '⋯';
+    $('np-current-time').classList.add('loading');
   } else if (!on && queue[currentIdx]) {
-    $('player-time').classList.remove('loading');
+    $('np-current-time').classList.remove('loading');
   }
 }
 
@@ -651,7 +652,7 @@ function updateNowPlaying(song) {
     img.style.display = 'none'; fpImg.style.display = 'none'; fpFallback.style.display = 'flex';
     if (fpBackdrop) fpBackdrop.style.backgroundImage = '';
   }
-  $('player-bar').style.display = 'flex';
+  $('player-bar').style.display = 'grid';
   updatePlayButtons();
   updateLikeButtons();
 }
@@ -1140,6 +1141,7 @@ function prevTrack() {
 function toggleShuffle() {
   shuffleOn = !shuffleOn;
   $('fp-shuffle').classList.toggle('active', shuffleOn);
+  $('np-shuffle').classList.toggle('active', shuffleOn);
   toast(shuffleOn ? 'Shuffle on' : 'Shuffle off');
 }
 
@@ -1150,6 +1152,7 @@ function toggleRepeat() {
   const labels = { off: '→', all: '\u{1F501}', one: '\u{1F502}' };
   $('fp-repeat').textContent = labels[repeatMode];
   $('fp-repeat').classList.toggle('active', repeatMode !== 'off');
+  $('np-repeat').classList.toggle('active', repeatMode !== 'off');
   toast('Repeat: ' + repeatMode);
 }
 
@@ -1206,7 +1209,7 @@ function updateTimeDisplay() {
     $('progress-fill').style.width = pct + '%';
     $('fp-progress-fill').style.width = pct + '%';
     const cur = fmt(c), tot = fmt(d);
-    $('player-time').textContent = cur + ' / ' + tot;
+    $('np-current-time').textContent = cur; $('np-total-time').textContent = tot;
     $('fp-current').textContent = cur; $('fp-total').textContent = tot;
   }
 }
