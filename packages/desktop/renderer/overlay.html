@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tuneless Quick Launcher</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="overlay.css">
+</head>
+<body>
+  <div class="overlay-container" id="overlay-container">
+    <!-- Header / Search input -->
+    <div class="search-header">
+      <div class="search-icon-wrap">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
+      </div>
+      <input type="text" id="playlist-search" placeholder="Type to filter playlists or press Enter to shuffle..." autocomplete="off" spellcheck="false" autofocus>
+      <div class="header-badges">
+        <span class="hud-badge"><kbd>Esc</kbd> close</span>
+      </div>
+    </div>
+
+    <!-- Quick action header -->
+    <div class="section-label" id="quick-action-label">QUICK SHUFFLE</div>
+    <div class="quick-action-card selected" id="quick-action-card" tabindex="0">
+      <div class="qa-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="16 3 21 3 21 8"></polyline>
+          <line x1="4" y1="20" x2="21" y2="3"></line>
+          <polyline points="21 16 21 21 16 21"></polyline>
+          <line x1="15" y1="15" x2="21" y2="21"></line>
+          <line x1="4" y1="4" x2="9" y2="9"></line>
+        </svg>
+      </div>
+      <div class="qa-info">
+        <div class="qa-title" id="qa-title">Shuffle Liked Songs</div>
+        <div class="qa-sub" id="qa-sub">Instant playback &middot; Shuffle ON</div>
+      </div>
+      <div class="qa-badge">
+        <span class="hud-badge accent"><kbd>↵</kbd> Play</span>
+      </div>
+    </div>
+
+    <!-- Playlists list -->
+    <div class="section-label">YOUR PLAYLISTS</div>
+    <div class="playlist-list" id="playlist-list">
+      <!-- Injected dynamically -->
+      <div class="empty-state">Loading playlists...</div>
+    </div>
+
+    <!-- Mini player footer -->
+    <div class="mini-player-strip" id="mini-player-strip">
+      <div class="np-left" onclick="openFullApp()" title="Click to open Tuneless">
+        <img class="np-thumb" id="np-thumb" src="" alt="" style="display:none;">
+        <div class="np-thumb-fallback" id="np-thumb-fallback">🎵</div>
+        <div class="np-meta">
+          <div class="np-title" id="np-title">Nothing playing</div>
+          <div class="np-artist" id="np-artist">Tuneless is idle</div>
+        </div>
+      </div>
+      <div class="np-controls">
+        <button class="np-btn" id="np-prev" onclick="prevTrack()" title="Previous track">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="19 20 9 12 19 4 19 20"/><line x1="5" y1="19" x2="5" y2="5"/></svg>
+        </button>
+        <button class="np-btn play" id="np-play" onclick="togglePlay()" title="Play / Pause">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" id="np-play-icon"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        </button>
+        <button class="np-btn" id="np-next" onclick="nextTrack()" title="Next track">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 4 15 12 5 20 5 4"/><line x1="19" y1="5" x2="19" y2="19"/></svg>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script src="overlay.js"></script>
+</body>
+</html>

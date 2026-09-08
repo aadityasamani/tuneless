@@ -37,10 +37,6 @@ contextBridge.exposeInMainWorld('tuneless', {
   onGoogleAuthResult: (callback) =>
     ipcRenderer.on('auth:google-result', (event, data) => callback(data)),
 
-  // Spotify playlist import
-  importSpotifyPlaylist: (clientId, clientSecret, playlistUrl) =>
-    ipcRenderer.invoke('spotify:import-playlist', { clientId, clientSecret, playlistUrl }),
-
   // Password recovery callback
   onRecovery: (callback) =>
     ipcRenderer.on('auth:recovery', (event, data) => callback(data)),
@@ -52,4 +48,25 @@ contextBridge.exposeInMainWorld('tuneless', {
   onMediaNext: (callback) => ipcRenderer.on('media:next', () => callback()),
   onMediaPrev: (callback) => ipcRenderer.on('media:prev', () => callback()),
   onMediaStop: (callback) => ipcRenderer.on('media:stop', () => callback()),
+
+  // Customizable global hotkey (works even when the window is hidden in tray)
+  registerHotkey: (accelerator) => ipcRenderer.invoke('hotkey:register', { accelerator }),
+  unregisterHotkey: () => ipcRenderer.invoke('hotkey:unregister'),
+  onHotkeyTrigger: (callback) => ipcRenderer.on('hotkey:trigger', () => callback()),
+
+  // Auto-start at system boot
+  getAutoStart: () => ipcRenderer.invoke('autostart:get'),
+  setAutoStart: (enabled) => ipcRenderer.invoke('autostart:set', { enabled }),
+
+  // Quick Launcher Overlay communication
+  onOverlayRequestState: (callback) => ipcRenderer.on('overlay:request-state', () => callback()),
+  sendOverlayState: (state) => ipcRenderer.send('overlay:send-state', state),
+  onOverlayPlayPlaylist: (callback) => ipcRenderer.on('overlay:play-playlist', (event, data) => callback(data)),
+
+  // Permanent Offline Music
+  downloadTrackOffline: (track) => ipcRenderer.invoke('offline:download', track),
+  deleteTrackOffline: (videoId) => ipcRenderer.invoke('offline:delete', { videoId }),
+  getOfflineTracks: () => ipcRenderer.invoke('offline:list'),
+  isOfflineTrack: (videoId) => ipcRenderer.invoke('offline:check', { videoId }),
 });
+

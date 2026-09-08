@@ -487,7 +487,44 @@ function bootApp() {
     window.tuneless.onMediaNext(() => nextTrack());
     window.tuneless.onMediaPrev(() => prevTrack());
     window.tuneless.onMediaStop(() => stopFromMediaControl());
+    window.tuneless.onHotkeyTrigger(() => handleHotkeyTrigger());
   }
+
+  // Register hotkey (default: Alt+Space for Quick Launcher HUD)
+  const savedHotkey = localStorage.getItem('tl_hotkey') || 'Alt+Space';
+  if (window.tuneless?.registerHotkey) {
+    window.tuneless.registerHotkey(savedHotkey).then(res => {
+      if (res?.ok && !localStorage.getItem('tl_hotkey')) {
+        localStorage.setItem('tl_hotkey', savedHotkey);
+      }
+    }).catch(e => {
+      console.warn('[hotkey] failed to register hotkey:', e);
+    });
+  }
+
+  // Quick Launcher Overlay IPC listeners
+  if (window.tuneless?.onOverlayRequestState) {
+    window.tuneless.onOverlayRequestState(() => sendOverlayState());
+  }
+  if (window.tuneless?.onOverlayPlayPlaylist) {
+    window.tuneless.onOverlayPlayPlaylist(({ plId, shuffle }) => {
+      if (plId === '__liked') {
+        if (shuffle) shufflePl('__liked');
+        else playPl('__liked');
+      } else {
+        const pl = playlists.find(p => p.id === plId);
+        if (pl) {
+          if (shuffle) shufflePl(plId);
+          else playPl(plId);
+        }
+      }
+      setTimeout(sendOverlayState, 300);
+    });
+  }
+
+  // Initialize offline library and equalizer
+  initOfflineLibrary();
+  initAudioEqualizer();
 }
 
 function toggleMute() {
@@ -533,15 +570,19 @@ audio.addEventListener('play', () => {
     updateNowPlaying(queue[currentIdx]);
     updateMediaSession(queue[currentIdx]);
   }
+  initAudioEqualizer();
+  sendOverlayState();
 });
 audio.addEventListener('pause', () => {
   isPlaying = false; updatePlayButtons(); stopProgress();
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+  sendOverlayState();
 });
 audio.addEventListener('ended', () => {
   console.log('Audio ended event fired, currentIdx:', currentIdx, 'queue length:', queue.length);
   isPlaying = false; stopProgress();
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'none';
+  sendOverlayState();
   const completedRequestId = _playRequestId;
   if (hasNextTrack()) {
     console.log('Auto-advancing to next track');
@@ -569,6 +610,7 @@ audio.addEventListener('seeked', () => {
 audio.addEventListener('loadedmetadata', publishMediaPosition);
 audio.addEventListener('timeupdate', () => {
   _hasPlayedData = true; updateTimeDisplay(); clearStallTimer();
+  updateFpLyrics(audio.currentTime);
   if (Date.now() - _lastMediaPositionUpdate >= 1000) publishMediaPosition();
 });
 let _stallTimer = null;
@@ -827,6 +869,8 @@ function updateNowPlaying(song) {
   if (fp && fpBg && thumbUrl) {
     fpBg.style.backgroundImage = `url("${thumbUrl}")`;
   }
+  fetchLyricsForCurrentTrack(song);
+  sendOverlayState();
 }
 
 function getYtThumb(id) { return id ? `https://img.youtube.com/vi/${id}/maxresdefault.jpg` : ''; }
@@ -894,7 +938,7 @@ function renderLibrary() {
   const likedPlaylist = getLikedPlaylist();
   const allPlaylists = likedPlaylist ? [likedPlaylist, ...playlists] : [...playlists];
   const totalTracks = allPlaylists.reduce((total, playlist) => total + (playlist.trackCount || 0), 0);
-  let html = `<section class="library-page"><header class="library-header"><div><div class="page-kicker">Your collection</div><h1 class="page-title">Library</h1><p class="page-description">${allPlaylists.length ? `${allPlaylists.length} playlist${allPlaylists.length === 1 ? '' : 's'} · ${totalTracks} track${totalTracks === 1 ? '' : 's'}` : 'Create a playlist or bring your music into Tuneless.'}</p></div></header><section class="library-actions"><button class="library-action primary" type="button" onclick="createNewPlaylist()"><span class="library-action-icon">+</span><span><strong>New playlist</strong><small>Start from scratch</small></span></button><button class="library-action" type="button" onclick="$('file-input').click()"><span class="library-action-icon">⇧</span><span><strong>Import file</strong><small>CSV or JSON export</small></span></button><button class="library-action spotify" type="button" onclick="importSpotifyPlaylist()"><span class="library-action-icon">↗</span><span><strong>Import Spotify</strong><small>From a playlist URL</small></span></button><input type="file" id="file-input" accept=".csv,.json" multiple hidden></section>`;
+  let html = `<section class="library-page"><header class="library-header"><div><div class="page-kicker">Your collection</div><h1 class="page-title">Library</h1><p class="page-description">${allPlaylists.length ? `${allPlaylists.length} playlist${allPlaylists.length === 1 ? '' : 's'} · ${totalTracks} track${totalTracks === 1 ? '' : 's'}` : 'Create a playlist or bring your music into Tuneless.'}</p></div></header><section class="library-actions"><button class="library-action primary" type="button" onclick="createNewPlaylist()"><span class="library-action-icon">+</span><span><strong>New playlist</strong><small>Start from scratch</small></span></button><button class="library-action" type="button" onclick="$('file-input').click()"><span class="library-action-icon">⇧</span><span><strong>Import file</strong><small>CSV or JSON export</small></span></button><input type="file" id="file-input" accept=".csv,.json" multiple hidden></section>`;
 
   if (!allPlaylists.length) {
     html += `<section class="library-empty"><div class="state-icon">&#x2261;</div><h2>Start your library</h2><p>Make a playlist for songs you love, or import a CSV/JSON export to keep your collection together.</p><button class="home-now-button primary" type="button" onclick="createNewPlaylist()">Create playlist</button></section>`;
@@ -995,20 +1039,47 @@ function createNewPlaylist() {
   });
 }
 
-function addCurrentToPlaylist(plId) {
+function addSongToPlaylist(plId, song) {
   const pl = playlists.find(p => p.id === plId);
-  if (!pl || currentIdx < 0) return;
-  const song = queue[currentIdx];
-  if (!song) return;
+  if (!pl || !song) return;
   const exists = pl.tracks.find(t => t.ytId === song.id);
   if (exists) { toast('Already in playlist'); return; }
   pl.tracks.push({ name: song.title, artist: song.artist, ytId: song.id });
   pl.trackCount = pl.tracks.length;
-  savePls(); toast('Added to ' + pl.name);
+  savePls();
+  syncPlaylistToCloud(pl);
+  toast('Added to ' + pl.name);
 }
 
-function showAddToPlaylistMenu() {
-  if (!queue[currentIdx]) return;
+function addCurrentToPlaylist(plId) {
+  addSongToPlaylist(plId, queue[currentIdx]);
+}
+
+// Resolve a song from any track list context so it can be saved to a playlist
+function showAddToPlaylistMenuFor(source, i) {
+  let song = null;
+  if (source === 'search') {
+    const r = searchResults[i];
+    if (r) song = { id: r.id, title: r.title, artist: r.artist };
+  } else if (source === 'queue') {
+    song = queue[i];
+  } else if (source === 'rec') {
+    const t = recommendedTracks[i];
+    if (t) song = { id: t.id, title: t.title, artist: t.artist };
+  } else if (source === 'recents') {
+    const t = recentlyPlayed[i];
+    if (t) song = { id: t.id, title: t.title, artist: t.artist };
+  }
+  if (!song) return;
+  showAddToPlaylistMenu(song);
+}
+
+function showAddToPlaylistMenu(song) {
+  // No explicit song → fall back to the currently playing track
+  if (!song) {
+    song = queue[currentIdx];
+    if (!song) { toast('Nothing playing to add'); return; }
+  }
   if (!playlists.length) { createNewPlaylist(); return; }
   // Build a select dropdown in the prompt modal
   const overlay = $('prompt-overlay');
@@ -1019,7 +1090,7 @@ function showAddToPlaylistMenu() {
 
   $('prompt-eyebrow').textContent = 'Your library';
   titleEl.textContent = 'Add to playlist';
-  $('prompt-description').textContent = 'Choose where to save the current track.';
+  $('prompt-description').textContent = 'Choose where to save "' + trunc(song.title, 40) + '".';
   $('prompt-error').textContent = '';
   okBtn.textContent = 'Add';
   // Replace the text input with a select dropdown
@@ -1045,7 +1116,7 @@ function showAddToPlaylistMenu() {
     okBtn.removeEventListener('click', onOk);
     cancelBtn.removeEventListener('click', onCancel);
     select.removeEventListener('change', onSelect);
-    if (idx >= 0 && idx < playlists.length) addCurrentToPlaylist(playlists[idx].id);
+    if (idx >= 0 && idx < playlists.length) addSongToPlaylist(playlists[idx].id, song);
   }
   function onOk() { close(parseInt(select.value)); }
   function onCancel() { close(-1); }
@@ -1165,6 +1236,83 @@ function renderSettings() {
         <span><kbd class="kb">F</kbd> Full player &middot; <kbd class="kb">L</kbd> Like</span>
       </div>
     </section>
+
+    <section class="settings-section">
+      <div class="settings-section-title">System & Startup</div>
+      <div class="health-card wide">
+        <div class="health-card-top"><span class="health-card-label">Auto-start</span><span class="status-pill" id="autostart-status">Checking...</span></div>
+        <div class="health-card-value">Start Tuneless automatically on Windows login.</div>
+        <p class="health-card-copy">Runs minimized in the background system tray so your global hotkey and offline playback are instantly ready on boot.</p>
+        <div class="health-card-actions">
+          <div class="settings-toggle">
+            <label class="toggle-label">Launch on system startup</label>
+            <input type="checkbox" id="autostart-toggle" class="toggle-input" onchange="toggleAutoStart(this.checked)">
+            <span class="toggle-slider"></span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="settings-section">
+      <div class="settings-section-title">Quick Launcher & Global Hotkey</div>
+      <div class="health-card wide">
+        <div class="health-card-top"><span class="health-card-label">Overlay Hotkey</span><span class="status-pill" id="hotkey-status">Not set</span></div>
+        <div class="health-card-value">Press your hotkey anywhere to summon the Quick Launcher HUD.</div>
+        <p class="health-card-copy">Instantly shuffle Liked Songs with <kbd class="kb">Enter</kbd>, pick any playlist with <kbd class="kb">1-9</kbd>, or filter without opening the full application window. Default is <code>Alt+Space</code>.</p>
+        <div class="settings-field"><input type="text" id="hotkey-input" class="setup-input" placeholder="e.g. Alt+Space" autocomplete="off" spellcheck="false" aria-label="Global hotkey"><button class="settings-button" onclick="saveHotkey()" id="hotkey-save-btn">Save</button></div>
+        <div class="health-card-actions"><button class="settings-button danger" onclick="clearHotkey()">Reset to default</button></div>
+      </div>
+    </section>
+
+    <section class="settings-section">
+      <div class="settings-section-title">Audio Equalizer & Sound</div>
+      <div class="health-card wide">
+        <div class="health-card-top">
+          <span class="health-card-label">Equalizer Presets</span>
+          <div class="eq-preset-pills">
+            <button class="eq-pill active" onclick="setEqPreset('flat')">Flat</button>
+            <button class="eq-pill" onclick="setEqPreset('bass')">Bass Boost</button>
+            <button class="eq-pill" onclick="setEqPreset('vocal')">Vocal</button>
+            <button class="eq-pill" onclick="setEqPreset('rock')">Rock</button>
+            <button class="eq-pill" onclick="setEqPreset('electronic')">Electronic</button>
+          </div>
+        </div>
+        <div class="health-card-actions" style="margin-top: 10px;">
+          <div class="settings-toggle">
+            <label class="toggle-label" style="font-weight: 500;">🔥 Bass Boost (+8dB Low Shelf)</label>
+            <input type="checkbox" id="bass-boost-toggle" class="toggle-input" onchange="toggleBassBoost(this.checked)">
+            <span class="toggle-slider"></span>
+          </div>
+        </div>
+        <div class="eq-sliders-wrap">
+          <div class="eq-slider-col">
+            <span class="eq-val" id="eq-val-0">0dB</span>
+            <input type="range" class="eq-v-slider" id="eq-band-0" min="-12" max="12" step="1" value="0" oninput="updateEqBand(0, this.value)">
+            <span class="eq-label">60Hz</span>
+          </div>
+          <div class="eq-slider-col">
+            <span class="eq-val" id="eq-val-1">0dB</span>
+            <input type="range" class="eq-v-slider" id="eq-band-1" min="-12" max="12" step="1" value="0" oninput="updateEqBand(1, this.value)">
+            <span class="eq-label">250Hz</span>
+          </div>
+          <div class="eq-slider-col">
+            <span class="eq-val" id="eq-val-2">0dB</span>
+            <input type="range" class="eq-v-slider" id="eq-band-2" min="-12" max="12" step="1" value="0" oninput="updateEqBand(2, this.value)">
+            <span class="eq-label">1kHz</span>
+          </div>
+          <div class="eq-slider-col">
+            <span class="eq-val" id="eq-val-3">0dB</span>
+            <input type="range" class="eq-v-slider" id="eq-band-3" min="-12" max="12" step="1" value="0" oninput="updateEqBand(3, this.value)">
+            <span class="eq-label">4kHz</span>
+          </div>
+          <div class="eq-slider-col">
+            <span class="eq-val" id="eq-val-4">0dB</span>
+            <input type="range" class="eq-v-slider" id="eq-band-4" min="-12" max="12" step="1" value="0" oninput="updateEqBand(4, this.value)">
+            <span class="eq-label">12kHz</span>
+          </div>
+        </div>
+      </div>
+    </section>
   </div>`;
 
   const cfSlider = $('crossfade-slider');
@@ -1176,6 +1324,478 @@ function renderSettings() {
   updateCookiesStatus();
   refreshPlaybackHealth();
   updateSleepTimerUI();
+  updateHotkeyUI();
+  updateAutoStartUI();
+  updateEqualizerUI();
+}
+
+function updateHotkeyUI() {
+  const input = $('hotkey-input');
+  const status = $('hotkey-status');
+  if (!input || !status) return;
+  const saved = localStorage.getItem('tl_hotkey') || 'Alt+Space';
+  input.value = saved;
+  status.textContent = 'Active (' + saved + ')';
+  status.className = 'status-pill good';
+}
+
+function saveHotkey() {
+  const input = $('hotkey-input');
+  const btn = $('hotkey-save-btn');
+  if (!input || !btn) return;
+  const accel = input.value.trim() || 'Alt+Space';
+  btn.disabled = true;
+  btn.textContent = 'Saving...';
+  if (!window.tuneless?.registerHotkey) {
+    toast('Hotkey API not available');
+    btn.disabled = false;
+    btn.textContent = 'Save';
+    return;
+  }
+  window.tuneless.registerHotkey(accel).then(result => {
+    if (result.ok) {
+      localStorage.setItem('tl_hotkey', accel);
+      updateHotkeyUI();
+      toast('Hotkey saved: ' + accel);
+    } else {
+      toast('Failed: ' + (result.error || 'unknown error'));
+    }
+    btn.disabled = false;
+    btn.textContent = 'Save';
+  }).catch(e => {
+    toast('Error: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'Save';
+  });
+}
+
+function clearHotkey() {
+  const def = 'Alt+Space';
+  if (!window.tuneless?.registerHotkey) {
+    toast('Hotkey API not available');
+    return;
+  }
+  window.tuneless.registerHotkey(def).then(() => {
+    localStorage.setItem('tl_hotkey', def);
+    updateHotkeyUI();
+    toast('Hotkey reset to ' + def);
+  }).catch(e => {
+    toast('Error: ' + e.message);
+  });
+}
+
+function handleHotkeyTrigger() {
+  // If overlay is used, main.js triggers the overlay window directly.
+  // As a fallback: toggle playback or play first playlist
+  if (queue.length > 0 && currentIdx >= 0) {
+    togglePlay();
+  } else if (playlists.length > 0) {
+    shufflePl(playlists[0].id);
+  }
+}
+
+// ── OVERLAY STATE SYNC ──────────────────────────────────────────────────
+function sendOverlayState() {
+  if (!window.tuneless?.sendOverlayState) return;
+  const likedPl = getLikedPlaylist();
+  const plList = [];
+  if (likedPl) plList.push(likedPl);
+  playlists.forEach(p => plList.push(p));
+
+  const cur = (queue && currentIdx >= 0) ? queue[currentIdx] : null;
+  const audioEl = $('audio-player');
+  const isP = audioEl ? !audioEl.paused : false;
+
+  window.tuneless.sendOverlayState({
+    playlists: plList,
+    currentTrack: cur,
+    isPlaying: isP,
+  });
+}
+
+// ── AUDIO EQUALIZER & BASS BOOST ─────────────────────────────────────────
+let audioCtx = null;
+let eqNodes = [];
+let bassBoostNode = null;
+let eqInitialized = false;
+
+const EQ_FREQS = [60, 250, 1000, 4000, 12000];
+const EQ_TYPES = ['lowshelf', 'peaking', 'peaking', 'peaking', 'highshelf'];
+const EQ_PRESETS = {
+  flat: [0, 0, 0, 0, 0],
+  bass: [6, 3, 0, 0, 0],
+  vocal: [-2, 1, 4, 3, 0],
+  rock: [4, 2, -2, 2, 4],
+  electronic: [5, 3, -1, 2, 4],
+};
+
+function initAudioEqualizer() {
+  if (eqInitialized) return;
+  const audioEl = $('audio-player');
+  if (!audioEl) return;
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return;
+    audioCtx = new AudioContextClass();
+    const source = audioCtx.createMediaElementSource(audioEl);
+    let lastNode = source;
+
+    const savedGains = JSON.parse(localStorage.getItem('tl_eq_bands') || '[0,0,0,0,0]');
+    eqNodes = EQ_FREQS.map((f, i) => {
+      const filter = audioCtx.createBiquadFilter();
+      filter.type = EQ_TYPES[i];
+      filter.frequency.value = f;
+      filter.gain.value = savedGains[i] || 0;
+      lastNode.connect(filter);
+      lastNode = filter;
+      return filter;
+    });
+
+    bassBoostNode = audioCtx.createBiquadFilter();
+    bassBoostNode.type = 'lowshelf';
+    bassBoostNode.frequency.value = 80;
+    const isBass = localStorage.getItem('tl_bass_boost') === 'true';
+    bassBoostNode.gain.value = isBass ? 8 : 0;
+    lastNode.connect(bassBoostNode);
+    lastNode = bassBoostNode;
+
+    lastNode.connect(audioCtx.destination);
+    eqInitialized = true;
+    console.log('[eq] Web Audio Equalizer initialized successfully');
+  } catch (e) {
+    console.warn('[eq] failed to init Web Audio EQ:', e.message);
+  }
+}
+
+function updateEqBand(index, value) {
+  initAudioEqualizer();
+  const val = parseFloat(value);
+  if (eqNodes[index]) {
+    eqNodes[index].gain.value = val;
+  }
+  const valEl = $(`eq-val-${index}`);
+  if (valEl) valEl.textContent = (val > 0 ? '+' : '') + val + 'dB';
+  const savedGains = JSON.parse(localStorage.getItem('tl_eq_bands') || '[0,0,0,0,0]');
+  savedGains[index] = val;
+  localStorage.setItem('tl_eq_bands', JSON.stringify(savedGains));
+  document.querySelectorAll('.eq-pill').forEach(p => p.classList.remove('active'));
+}
+
+function setEqPreset(name) {
+  initAudioEqualizer();
+  const preset = EQ_PRESETS[name] || EQ_PRESETS.flat;
+  preset.forEach((val, i) => {
+    if (eqNodes[i]) eqNodes[i].gain.value = val;
+    const slider = $(`eq-band-${i}`);
+    if (slider) slider.value = val;
+    const valEl = $(`eq-val-${i}`);
+    if (valEl) valEl.textContent = (val > 0 ? '+' : '') + val + 'dB';
+  });
+  localStorage.setItem('tl_eq_bands', JSON.stringify(preset));
+  localStorage.setItem('tl_eq_preset', name);
+
+  if (name === 'bass') {
+    toggleBassBoost(true);
+  }
+
+  document.querySelectorAll('.eq-pill').forEach(p => {
+    p.classList.toggle('active', p.textContent.toLowerCase().includes(name));
+  });
+  toast(`Equalizer: ${name.charAt(0).toUpperCase() + name.slice(1)}`);
+}
+
+function toggleBassBoost(enabled) {
+  initAudioEqualizer();
+  if (bassBoostNode) {
+    bassBoostNode.gain.value = enabled ? 8 : 0;
+  }
+  localStorage.setItem('tl_bass_boost', enabled.toString());
+  const toggle = $('bass-boost-toggle');
+  if (toggle) toggle.checked = enabled;
+}
+
+function updateEqualizerUI() {
+  const savedGains = JSON.parse(localStorage.getItem('tl_eq_bands') || '[0,0,0,0,0]');
+  const isBass = localStorage.getItem('tl_bass_boost') === 'true';
+  const savedPreset = localStorage.getItem('tl_eq_preset') || 'flat';
+
+  savedGains.forEach((val, i) => {
+    const slider = $(`eq-band-${i}`);
+    if (slider) slider.value = val;
+    const valEl = $(`eq-val-${i}`);
+    if (valEl) valEl.textContent = (val > 0 ? '+' : '') + val + 'dB';
+  });
+
+  const toggle = $('bass-boost-toggle');
+  if (toggle) toggle.checked = isBass;
+
+  document.querySelectorAll('.eq-pill').forEach(p => {
+    p.classList.toggle('active', p.textContent.toLowerCase().includes(savedPreset));
+  });
+}
+
+// ── SYNCED LYRICS ENGINE ────────────────────────────────────────────────
+let currentLyrics = null;
+let currentLyricsActiveIdx = -1;
+let isFpLyricsVisible = false;
+let currentLyricsSongKey = null;
+
+function parseLrc(lrcText) {
+  if (!lrcText) return [];
+  const lines = lrcText.split('\n');
+  const result = [];
+  const timeRegex = /\[(\d{2}):(\d{2})\.(\d{2,3})\]/g;
+
+  for (const line of lines) {
+    let match;
+    const timeIndices = [];
+    while ((match = timeRegex.exec(line)) !== null) {
+      const min = parseInt(match[1], 10);
+      const sec = parseInt(match[2], 10);
+      const ms = parseFloat('0.' + match[3]);
+      timeIndices.push(min * 60 + sec + ms);
+    }
+    const text = line.replace(/\[\d{2}:\d{2}\.\d{2,3}\]/g, '').trim();
+    if (text) {
+      for (const time of timeIndices) {
+        result.push({ time, text });
+      }
+    }
+  }
+  result.sort((a, b) => a.time - b.time);
+  return result;
+}
+
+async function fetchLyricsForCurrentTrack(song) {
+  if (!song) return;
+  const songKey = (song.id || song.ytId || '') + '_' + (song.title || song.name || '');
+  if (songKey === currentLyricsSongKey && currentLyrics) return;
+  currentLyricsSongKey = songKey;
+  currentLyrics = null;
+  currentLyricsActiveIdx = -1;
+
+  const statusEl = $('fp-lyrics-status');
+  const container = $('fp-lyrics-container');
+  if (statusEl) statusEl.textContent = 'Searching lyrics...';
+  if (container) container.innerHTML = '<div class="fp-lyrics-status" id="fp-lyrics-status">Searching lyrics...</div>';
+
+  const rawTitle = song.title || song.name || '';
+  const cleanTitle = rawTitle
+    .replace(/\s*[\(\[][^()\[\]]*(?:official|video|audio|lyrics|feat|ft|remastered|hd|4k)[^()\[\]]*[\)\]]/gi, '')
+    .trim();
+  const artist = normalizeArtist(song.artist) || '';
+
+  try {
+    const res = await fetch(`https://lrclib.net/api/get?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(cleanTitle)}`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.syncedLyrics) {
+        currentLyrics = parseLrc(data.syncedLyrics);
+        renderLyrics();
+        return;
+      } else if (data.plainLyrics) {
+        currentLyrics = data.plainLyrics.split('\n').filter(l => l.trim()).map((l, idx) => ({ time: idx * 9999, text: l }));
+        renderLyrics();
+        return;
+      }
+    }
+
+    const searchRes = await fetch(`https://lrclib.net/api/search?q=${encodeURIComponent(cleanTitle + ' ' + artist)}`);
+    if (searchRes.ok) {
+      const items = await searchRes.json();
+      if (items && items.length > 0) {
+        const best = items.find(i => i.syncedLyrics) || items[0];
+        if (best.syncedLyrics) {
+          currentLyrics = parseLrc(best.syncedLyrics);
+          renderLyrics();
+          return;
+        } else if (best.plainLyrics) {
+          currentLyrics = best.plainLyrics.split('\n').filter(l => l.trim()).map((l, idx) => ({ time: idx * 9999, text: l }));
+          renderLyrics();
+          return;
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[lyrics] fetch failed:', err.message);
+  }
+
+  const curStatusEl = $('fp-lyrics-status');
+  if (curStatusEl) curStatusEl.textContent = 'No synchronized lyrics found for this song';
+}
+
+function renderLyrics() {
+  const container = $('fp-lyrics-container');
+  if (!container || !currentLyrics || !currentLyrics.length) return;
+
+  container.innerHTML = currentLyrics.map((line, idx) => {
+    return `<div class="fp-lyric-line" data-index="${idx}" onclick="seekToLyricLine(${idx})">${esc(line.text)}</div>`;
+  }).join('');
+}
+
+function seekToLyricLine(idx) {
+  if (!currentLyrics || !currentLyrics[idx]) return;
+  const targetTime = currentLyrics[idx].time;
+  if (targetTime < 9999 && audio) {
+    audio.currentTime = targetTime;
+  }
+}
+
+function toggleFpLyrics() {
+  isFpLyricsVisible = !isFpLyricsVisible;
+  const fpMain = $('fp-main');
+  const btn = $('fp-lyrics-btn');
+  const wrap = $('fp-lyrics-wrap');
+  if (fpMain) fpMain.classList.toggle('lyrics-mode', isFpLyricsVisible);
+  if (btn) btn.classList.toggle('active', isFpLyricsVisible);
+  if (wrap) wrap.classList.toggle('visible', isFpLyricsVisible);
+
+  if (isFpLyricsVisible) {
+    const cur = queue[currentIdx];
+    if (cur) fetchLyricsForCurrentTrack(cur);
+  }
+}
+
+function updateFpLyrics(currentTime) {
+  if (!isFpLyricsVisible || !currentLyrics || !currentLyrics.length) return;
+
+  let activeIdx = -1;
+  for (let i = 0; i < currentLyrics.length; i++) {
+    if (currentTime >= currentLyrics[i].time - 0.2) {
+      activeIdx = i;
+    } else {
+      break;
+    }
+  }
+
+  if (activeIdx !== currentLyricsActiveIdx && activeIdx >= 0) {
+    currentLyricsActiveIdx = activeIdx;
+    const lines = document.querySelectorAll('.fp-lyric-line');
+    lines.forEach((l, i) => {
+      if (i === activeIdx) {
+        l.classList.add('active');
+        l.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      } else {
+        l.classList.remove('active');
+      }
+    });
+  }
+}
+
+// ── PERMANENT OFFLINE MUSIC ─────────────────────────────────────────────
+let offlineTrackIds = new Set();
+let isDownloadingPlaylist = false;
+
+async function initOfflineLibrary() {
+  if (!window.tuneless?.getOfflineTracks) return;
+  try {
+    const list = await window.tuneless.getOfflineTracks();
+    offlineTrackIds = new Set((list || []).map(i => i.videoId || i.id));
+    if (tab === 'library') renderLibrary();
+    if (currentPlaylistId) renderPlaylistDetail(currentPlaylistId);
+  } catch (e) {
+    console.warn('[offline] could not load offline tracks:', e);
+  }
+}
+
+async function downloadCurrentPlaylistOffline(plId) {
+  if (isDownloadingPlaylist) {
+    toast('A download is already in progress');
+    return;
+  }
+  const isLiked = plId === '__liked';
+  const pl = isLiked ? getLikedPlaylist() : playlists.find(p => p.id === plId);
+  if (!pl || !pl.tracks.length) {
+    toast('No tracks to download');
+    return;
+  }
+
+  const btn = $('pl-download-btn');
+  const label = $('pl-download-label');
+  if (btn) btn.classList.add('downloading');
+  isDownloadingPlaylist = true;
+
+  toast(`Starting offline download for "${pl.name}"...`);
+  let downloadedCount = 0;
+
+  for (let i = 0; i < pl.tracks.length; i++) {
+    const track = pl.tracks[i];
+    if (label) label.textContent = `${i + 1}/${pl.tracks.length}`;
+
+    let videoId = track.ytId;
+    if (!videoId) {
+      const c = ytCache[cacheKey(track)];
+      if (c) videoId = c;
+      else if (window.tuneless?.resolveTrack && API_KEY) {
+        try {
+          videoId = await window.tuneless.resolveTrack(track.name, track.artist, API_KEY);
+          if (videoId) {
+            track.ytId = videoId;
+            ytCache[cacheKey(track)] = videoId;
+            saveCache();
+          }
+        } catch {}
+      }
+    }
+
+    if (!videoId) continue;
+
+    try {
+      const res = await window.tuneless.downloadTrackOffline({
+        videoId,
+        title: track.name,
+        artist: track.artist,
+        thumb: track.ytId ? getYtThumb(track.ytId) : '',
+        duration: track.duration || '—',
+      });
+      if (res?.ok) {
+        offlineTrackIds.add(videoId);
+        downloadedCount++;
+      }
+    } catch (err) {
+      console.warn('[offline] failed to download track:', track.name, err);
+    }
+  }
+
+  isDownloadingPlaylist = false;
+  if (btn) {
+    btn.classList.remove('downloading');
+    btn.classList.add('downloaded');
+  }
+  if (label) label.textContent = 'Downloaded ✓';
+
+  toast(`Downloaded ${downloadedCount} tracks for offline listening!`);
+  if (currentPlaylistId === plId) renderPlaylistDetail(plId);
+}
+
+// ── AUTO-START AT BOOT ──────────────────────────────────────────────────
+async function updateAutoStartUI() {
+  const toggle = $('autostart-toggle');
+  const status = $('autostart-status');
+  if (!toggle || !status || !window.tuneless?.getAutoStart) return;
+  try {
+    const enabled = await window.tuneless.getAutoStart();
+    toggle.checked = enabled;
+    status.textContent = enabled ? 'Enabled' : 'Disabled';
+    status.className = enabled ? 'status-pill good' : 'status-pill';
+  } catch (e) {
+    status.textContent = 'Unavailable';
+  }
+}
+
+async function toggleAutoStart(enabled) {
+  if (!window.tuneless?.setAutoStart) return;
+  const status = $('autostart-status');
+  try {
+    const res = await window.tuneless.setAutoStart(enabled);
+    if (status) {
+      status.textContent = res.enabled ? 'Enabled' : 'Disabled';
+      status.className = res.enabled ? 'status-pill good' : 'status-pill';
+    }
+    toast(res.enabled ? 'Launch on startup enabled' : 'Launch on startup disabled');
+  } catch (e) {
+    toast('Failed to change startup setting: ' + e.message);
+  }
 }
 
 function backToLibrary() {
@@ -1203,7 +1823,9 @@ function renderPlaylistDetail(plId) {
   const art = artTrack?.ytId
     ? `<img src="${esc(getYtThumb(artTrack.ytId))}" alt="" loading="lazy">`
     : isLiked ? '<svg width="30" height="30" viewBox="0 0 24 24" fill="currentColor"><use href="#icon-heart-fill"/></svg>' : '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>';
-  let html = `<section class="playlist-detail-page"><button class="playlist-back" type="button" onclick="backToLibrary()"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-arrow-left"/></svg> Library</button><header class="playlist-detail-header"><div class="playlist-detail-art${isLiked ? ' liked' : ''}">${art}</div><div class="playlist-detail-copy"><div class="page-kicker">${isLiked ? 'Your saved tracks' : 'Playlist'}</div><h1>${esc(pl.name)}</h1><p id="pl-detail-meta">${pl.trackCount} track${pl.trackCount === 1 ? '' : 's'} · ${cached} resolved · ${filtered.length} shown</p></div><div class="pl-action-group"><button class="pl-play-btn" id="pl-play-btn" type="button" onclick="playPl('${plId}', event)" title="Play playlist" aria-label="Play ${esc(pl.name)}"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="6 3 20 12 6 21 6 3"/></svg><span>Play</span></button><button class="pl-shuffle-toggle${shuffleOn ? ' active' : ''}" id="pl-shuffle-toggle" type="button" onclick="toggleShuffleFromPlaylist('${plId}', event)" title="Toggle shuffle" aria-label="Toggle shuffle"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-shuffle"/></svg></button></div></header><div class="playlist-filter-wrap"><label for="pl-filter">Filter tracks</label><input type="text" id="pl-filter" placeholder="Search ${pl.trackCount} tracks" autocomplete="off" spellcheck="false" value="${esc(_plFilter)}"></div><div class="playlist-tracks-heading"><span>Tracks</span><span>${isLiked ? 'Saved to your library' : 'Drag to reorder'}</span></div><div class="playlist-tracks" id="pl-tracks"></div></section>`;
+  const isPlOffline = pl.tracks.length > 0 && pl.tracks.every(t => t.ytId && offlineTrackIds.has(t.ytId));
+  const downloadBtn = `<button class="pl-download-btn${isPlOffline ? ' downloaded' : ''}" id="pl-download-btn" type="button" onclick="downloadCurrentPlaylistOffline('${plId}')" title="${isPlOffline ? 'All tracks saved offline' : 'Download playlist for offline listening'}"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg><span id="pl-download-label">${isPlOffline ? 'Saved ✓' : 'Download'}</span></button>`;
+  let html = `<section class="playlist-detail-page"><button class="playlist-back" type="button" onclick="backToLibrary()"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-arrow-left"/></svg> Library</button><header class="playlist-detail-header"><div class="playlist-detail-art${isLiked ? ' liked' : ''}">${art}</div><div class="playlist-detail-copy"><div class="page-kicker">${isLiked ? 'Your saved tracks' : 'Playlist'}</div><h1>${esc(pl.name)}</h1><p id="pl-detail-meta">${pl.trackCount} track${pl.trackCount === 1 ? '' : 's'} · ${cached} resolved · ${filtered.length} shown</p></div><div class="pl-action-group"><button class="pl-play-btn" id="pl-play-btn" type="button" onclick="playPl('${plId}', event)" title="Play playlist" aria-label="Play ${esc(pl.name)}"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="6 3 20 12 6 21 6 3"/></svg><span>Play</span></button><button class="pl-shuffle-toggle${shuffleOn ? ' active' : ''}" id="pl-shuffle-toggle" type="button" onclick="toggleShuffleFromPlaylist('${plId}', event)" title="Toggle shuffle" aria-label="Toggle shuffle"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-shuffle"/></svg></button>${downloadBtn}<button class="pl-add-btn" type="button" onclick="addPlaylistToQueue('${plId}', event)" title="Add to queue" aria-label="Add ${esc(pl.name)} to queue"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-plus"/></svg></button></div></header><div class="playlist-filter-wrap"><label for="pl-filter">Filter tracks</label><input type="text" id="pl-filter" placeholder="Search ${pl.trackCount} tracks" autocomplete="off" spellcheck="false" value="${esc(_plFilter)}"></div><div class="playlist-tracks-heading"><span>Tracks</span><span>${isLiked ? 'Saved to your library' : 'Drag to reorder'}</span></div><div class="playlist-tracks" id="pl-tracks"></div></section>`;
 
   $('content').innerHTML = html;
   renderPlaylistTracks(pl, plId, filtered);
@@ -1225,6 +1847,85 @@ function renderPlaylistDetail(plId) {
   }
 }
 
+async function addPlaylistToQueue(plId, evt) {
+  const isLiked = plId === '__liked';
+  const pl = isLiked ? getLikedPlaylist() : playlists.find(p => p.id === plId);
+  if (!pl?.tracks.length) { toast('No tracks in playlist'); return; }
+  const btn = evt?.target?.closest('.pl-add-btn') || null;
+  if (btn) { btn.classList.add('loading'); setIcon(btn, 'refresh', 16); }
+
+  // Separate cached and uncached tracks
+  const tracks = [];
+  for (const t of pl.tracks) {
+    if (t.ytId) { tracks.push(t); continue; }
+    const c = ytCache[cacheKey(t)]; if (c) { t.ytId = c; tracks.push(t); continue; }
+    tracks.push(t); // uncached, will resolve during playback
+  }
+
+  // Shuffle if enabled (Fisher-Yates)
+  if (shuffleOn) {
+    for (let i = tracks.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [tracks[i], tracks[j]] = [tracks[j], tracks[i]];
+    }
+  }
+
+  // Add to queue
+  const added = [];
+  for (const t of tracks) {
+    if (t.ytId) {
+      added.push({ id: t.ytId, title: t.name, artist: t.artist, thumb: getYtThumb(t.ytId || ''), duration: '' });
+    }
+  }
+
+  // If nothing is cached, resolve the first track immediately
+  if (!added.length && tracks.length > 0) {
+    toast('Resolving tracks...');
+    try {
+      const id = await window.tuneless.resolveTrack(tracks[0].name, tracks[0].artist, API_KEY);
+      if (id) {
+        tracks[0].ytId = id;
+        ytCache[cacheKey(tracks[0])] = id;
+        added.push({ id, title: tracks[0].name, artist: tracks[0].artist, thumb: getYtThumb(id), duration: '' });
+      }
+    } catch (e) { console.error('[addPlaylistToQueue] resolve failed:', e); }
+  }
+
+  // Add to queue
+  if (added.length > 0) {
+    queue.push(...added);
+    toast(`Added ${pl.name} to queue (${added.length} tracks)`);
+    saveSession();
+    if (tab === 'queue') renderQueue();
+  } else {
+    toast('Could not resolve any tracks. Check your API key.');
+  }
+
+  // Background resolve remaining uncached tracks
+  const uncachedRemaining = tracks.slice(added.length > 0 ? 1 : 0).filter(t => !t.ytId);
+  if (uncachedRemaining.length > 0) {
+    let resolvedCount = 0;
+    for (const t of uncachedRemaining) {
+      try {
+        const id = await window.tuneless.resolveTrack(t.name, t.artist, API_KEY);
+        if (id) {
+          t.ytId = id;
+          ytCache[cacheKey(t)] = id;
+          queue.push({ id, title: t.name, artist: t.artist, thumb: getYtThumb(id), duration: '' });
+          resolvedCount++;
+        }
+      } catch {}
+    }
+    saveCache(); savePls();
+    if (resolvedCount > 0) toast(`+${resolvedCount} tracks cached`);
+  }
+
+  if (btn) {
+    btn.classList.remove('loading');
+    btn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-plus"/></svg>`;
+  }
+}
+
 function renderPlaylistTracks(pl, plId, filtered) {
   const el = $('pl-tracks');
   if (!el) return;
@@ -1236,10 +1937,36 @@ function renderPlaylistTracks(pl, plId, filtered) {
       const isCurrentlyPlaying = queue[currentIdx]?.id === (track.ytId || '');
       const thumb = track.ytId ? getYtThumb(track.ytId) : '';
       const realIdx = pl.tracks.indexOf(track);
+      const isOffline = track.ytId && offlineTrackIds.has(track.ytId);
+      const offlineBadge = isOffline ? '<span class="track-offline-badge" title="Saved for offline listening">✓ Offline</span>' : '';
       const status = isCurrentlyPlaying ? '<span class="playlist-track-status playing">Playing</span>' : track.ytId ? '<span class="playlist-track-status ready">Ready</span>' : '<span class="playlist-track-status">Will resolve</span>';
-      return `<div class="playlist-track${isCurrentlyPlaying ? ' playing' : ''}" draggable="${!isLiked}" ondragstart="_dragIdx=${realIdx};this.classList.add('dragging')" ondragend="this.classList.remove('dragging')" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="event.preventDefault();this.classList.remove('drag-over');reorderTrack('${plId}',_dragIdx,${realIdx})" onclick="playPlaylistTrack('${plId}', ${realIdx})"><span class="playlist-track-order">${!isLiked ? '<span class="playlist-drag-handle" title="Drag to reorder">⠿</span>' : realIdx + 1}</span><div class="track-thumb">${thumb ? `<img src="${esc(thumb)}" loading="lazy" alt="">` : ''}</div><div class="track-info"><div class="track-title">${esc(track.name)}</div><div class="track-artist">${esc(normalizeArtist(track.artist) || 'Unknown')}</div></div>${status}</div>`;
+      const removeBtn = `<button class="playlist-track-remove" type="button" onclick="event.stopPropagation();removeTrackFromPlaylist('${plId}', ${realIdx})" title="Remove from playlist" aria-label="Remove ${esc(track.name)} from playlist"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><use href="#icon-x"/></svg></button>`;
+      return `<div class="playlist-track${isCurrentlyPlaying ? ' playing' : ''}" draggable="${!isLiked}" ondragstart="_dragIdx=${realIdx};this.classList.add('dragging')" ondragend="this.classList.remove('dragging')" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="event.preventDefault();this.classList.remove('drag-over');reorderTrack('${plId}',_dragIdx,${realIdx})" onclick="playPlaylistTrack('${plId}', ${realIdx})"><span class="playlist-track-order">${!isLiked ? '<span class="playlist-drag-handle" title="Drag to reorder">⠿</span>' : realIdx + 1}</span><div class="track-thumb">${thumb ? `<img src="${esc(thumb)}" loading="lazy" alt="">` : ''}</div><div class="track-info"><div class="track-title">${esc(track.name)}</div><div class="track-artist">${esc(normalizeArtist(track.artist) || 'Unknown')}</div></div>${offlineBadge}${status}${removeBtn}</div>`;
     }).join('');
   }
+}
+
+function removeTrackFromPlaylist(plId, trackIndex) {
+  const isLiked = plId === '__liked';
+  if (isLiked) {
+    // For Liked Songs, removing means un-liking the track
+    const pl = getLikedPlaylist();
+    const track = pl?.tracks[trackIndex];
+    if (!track?.ytId) return;
+    toggleLike(track.ytId);
+    toast('Removed from Liked Songs');
+    if (currentPlaylistId === plId) renderPlaylistDetail(plId);
+    return;
+  }
+  const pl = playlists.find(p => p.id === plId);
+  if (!pl || trackIndex < 0 || trackIndex >= pl.tracks.length) return;
+  const [removed] = pl.tracks.splice(trackIndex, 1);
+  pl.trackCount = pl.tracks.length;
+  savePls();
+  syncPlaylistToCloud(pl);
+  toast(`Removed "${trunc(removed.name, 30)}" from ${pl.name}`);
+  if (currentPlaylistId === plId) renderPlaylistDetail(plId);
+  else if (tab === 'library') renderLibrary();
 }
 
 function reorderTrack(plId, fromIdx, toIdx) {
@@ -1293,7 +2020,7 @@ function trackHtml(r, i, ctx) {
   const primaryAction = `<button class="pc-btn pc-btn-next${queuedNext ? ' active' : ''}" onclick="event.stopPropagation();${ctx==='queue' ? 'playNextQueue('+i+')' : 'playNextSearch('+i+')'}" title="${queuedNext ? 'Already set to play next' : queued ? 'Move to Play Next' : 'Play next'}" aria-label="${queuedNext ? 'Already set to play next' : 'Play ' + esc(titleAttr) + ' next'}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 4 15 12 5 20 5 4"/><line x1="19" y1="5" x2="19" y2="19"/></svg><span class="pc-btn-label">${queuedNext ? 'Next' : 'Play next'}</span></button>`;
   const secondaryAction = ctx === 'queue'
     ? `<button class="pc-btn pc-btn-remove" onclick="event.stopPropagation();removeQueueTrack(${i})" title="Remove from queue" aria-label="Remove ${esc(titleAttr)} from queue"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/></svg><span class="pc-btn-label">Remove</span></button>`
-    : `<button class="pc-btn" onclick="event.stopPropagation();addSearchToQueue(${i})" title="${queued ? 'Already in queue' : 'Add to queue'}" aria-label="Add ${esc(titleAttr)} to queue"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-plus"/></svg><span class="pc-btn-label">Add</span></button>`;
+    : `<button class="pc-btn" onclick="event.stopPropagation();showAddToPlaylistMenuFor('${ctx}', ${i})" title="Add to playlist" aria-label="Add ${esc(titleAttr)} to playlist"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-plus"/></svg><span class="pc-btn-label">Add to playlist</span></button>`;
   return `<div class="track-item${playing?' playing':''}${isSearch ? ' search-track-item' : ''}">
     <button class="track-main" type="button" onclick="${ctx==='queue' ? 'playFromQ('+i+')' : 'playSearch('+i+')'}" aria-label="Play ${esc(titleAttr)}">
       <div class="track-thumb">${thumb ? `<img src="${esc(thumb)}" loading="lazy" alt="">` : ''}</div>
@@ -1839,61 +2566,6 @@ function delPl(id) {
 }
 
 // ── FILE HANDLER ─────────────────────────────────────────────────────────
-// ── SPOTIFY IMPORT ──────────────────────────────────────────────────────
-async function importSpotifyPlaylist() {
-  showPrompt({
-    eyebrow: 'Import music',
-    title: 'Import a Spotify playlist',
-    description: 'Paste a public Spotify playlist URL. Your tracks will be added to your local library.',
-    placeholder: 'https://open.spotify.com/playlist/...',
-    actionLabel: 'Import playlist',
-    inputType: 'url',
-    validate: url => url.includes('spotify.com/playlist/') ? '' : 'Enter a valid Spotify playlist URL.',
-  }, async url => {
-    // Try to use stored credentials, or ask for them
-    let clientId = localStorage.getItem('tl_spotify_client_id') || '';
-    let clientSecret = localStorage.getItem('tl_spotify_client_secret') || '';
-
-    if (!clientId || !clientSecret) {
-      // Use the app's built-in credentials (for basic import)
-      // These are limited but work for public playlists
-      clientId = '7a09d7e8b0954e4a92e7b4e0f8c3d2a1'; // placeholder
-      clientSecret = 'f5e4d3c2b1a09876543210fedcba9876'; // placeholder
-      // If these don't work, show error asking user to configure
-      toast('Importing from Spotify...');
-    }
-
-    try {
-      if (!window.tuneless?.importSpotifyPlaylist) {
-        toast('Spotify import not available');
-        return;
-      }
-      const result = await window.tuneless.importSpotifyPlaylist(clientId, clientSecret, url);
-      if (result.error) {
-        toast('Import failed: ' + result.error);
-        return;
-      }
-      if (!result.tracks?.length) {
-        toast('No tracks found in this playlist');
-        return;
-      }
-      // Create the playlist
-      const pl = {
-        id: 'spotify_' + Date.now() + '_' + Math.random().toString(36).slice(2),
-        name: result.name || 'Imported from Spotify',
-        trackCount: result.tracks.length,
-        tracks: result.tracks,
-      };
-      playlists.unshift(pl);
-      savePls();
-      renderLibrary();
-      toast(`Imported "${pl.name}" (${pl.tracks.length} tracks)`);
-    } catch (e) {
-      toast('Import error: ' + e.message);
-    }
-  });
-}
-
 function handleFiles(files) {
   if (!files?.length) return;
   Array.from(files).forEach(file => {

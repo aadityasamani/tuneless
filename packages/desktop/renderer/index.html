@@ -416,6 +416,9 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 .playlist-track-status { flex: 0 0 auto; padding: 3px 7px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-muted); font-size: var(--fs-xs); white-space: nowrap; }
 .playlist-track-status.ready { color: #86efac; border-color: rgba(34,197,94,0.35); background: rgba(34,197,94,0.07); }
 .playlist-track-status.playing { color: var(--text); border-color: var(--text-muted); }
+.playlist-track-remove { flex: 0 0 auto; display: grid; place-items: center; width: 26px; height: 26px; border: none; border-radius: 50%; background: none; color: var(--text-muted); cursor: pointer; opacity: 0; transition: all var(--transition); }
+.playlist-track:hover .playlist-track-remove { opacity: 1; }
+.playlist-track-remove:hover { color: #f87171; background: rgba(248,113,113,0.12); }
 .playlist-tracks-empty { display: flex; flex-direction: column; align-items: center; padding: var(--sp-10) var(--sp-6); border: 1px dashed var(--border); border-radius: var(--radius); color: var(--text-muted); text-align: center; }
 .playlist-tracks-empty .state-sub { margin-top: var(--sp-1); }
 
@@ -435,6 +438,9 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 .pl-shuffle-toggle { width: 38px; height: 38px; border-radius: 50%; border: 1px solid var(--border); background: var(--surface); color: var(--text-muted); cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all var(--transition); flex-shrink: 0; position: relative; }
 .pl-shuffle-toggle:hover { color: var(--text); background: var(--surface-2); }
 .pl-shuffle-toggle.active { color: var(--bg); background: var(--text); border-color: var(--text); }
+.pl-add-btn { width: 38px; height: 38px; border-radius: 50%; border: 1px solid var(--border); background: var(--surface); color: var(--text-muted); cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all var(--transition); flex-shrink: 0; position: relative; }
+.pl-add-btn:hover { color: var(--text); background: var(--surface-2); }
+.pl-add-btn.loading { opacity: 0.5; cursor: default; }
 @media (max-width: 700px) { .playlist-detail-header { align-items: flex-start; flex-wrap: wrap; } .playlist-detail-art { width: 92px; height: 92px; } .playlist-detail-copy { min-width: calc(100% - 116px); } .pl-action-group { width: 100%; } .playlist-filter-wrap { align-items: stretch; flex-direction: column; gap: var(--sp-2); } #pl-filter { width: 100%; } .playlist-track-status { display: none; } }
 
 /* Feedback */
@@ -537,12 +543,46 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 .settings-button.danger:hover { color: #fca5a5; border-color: rgba(239,68,68,0.5); }
 .settings-field { display: flex; gap: var(--sp-2); margin-top: var(--sp-3); }
 .settings-field .setup-input { min-width: 0; }
+
+/* Hotkey-specific styles */
+#hotkey-input { font-family: 'Courier New', monospace; font-size: var(--fs-sm); }
+.kb { display: inline-block; padding: 0 4px; border: 1px solid var(--border); border-radius: 2px; font-family: inherit; font-size: 9px; background: var(--surface-2); color: var(--text-tertiary); }
 .settings-range { display: flex; align-items: center; gap: var(--sp-3); margin-top: var(--sp-3); }
 .settings-range input { flex: 1; accent-color: var(--text); }
 .settings-shortcuts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-2) var(--sp-5); color: var(--text-muted); font-size: var(--fs-xs); line-height: 1.8; }
 .diagnostic-output { display: none; margin-top: var(--sp-3); padding: var(--sp-3); border: 1px solid var(--border); border-radius: var(--radius-sm); background: #0c0c0c; color: var(--text-secondary); font: 11px/1.7 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; }
 .diagnostic-output.visible { display: block; }
+/* Lyrics View */
+.fp-lyrics-wrap { display: none; width: 100%; max-width: 580px; height: 50vh; overflow-y: auto; padding: var(--sp-6) var(--sp-4); text-align: center; position: relative; scroll-behavior: smooth; }
+.fp-lyrics-wrap::-webkit-scrollbar { width: 0; display: none; }
+.fp-lyrics-wrap.visible { display: block; }
+.fp-main.lyrics-mode .fp-artwork-wrap { display: none; }
+.fp-main.lyrics-mode .fp-lyrics-wrap { display: block; }
+.fp-lyric-line { font-size: 20px; font-weight: 600; color: rgba(255, 255, 255, 0.3); padding: 10px 14px; border-radius: 8px; cursor: pointer; transition: all 200ms ease; line-height: 1.5; }
+.fp-lyric-line:hover { color: rgba(255, 255, 255, 0.7); background: rgba(255, 255, 255, 0.04); }
+.fp-lyric-line.active { color: #ffffff; font-size: 22px; font-weight: 700; transform: scale(1.03); text-shadow: 0 0 20px rgba(255, 255, 255, 0.35); }
+.fp-lyrics-status { font-size: 14px; color: rgba(255, 255, 255, 0.4); padding: 40px 0; }
+.fp-topbar-btn.active { color: #fff; background: rgba(255, 255, 255, 0.18); }
+
+/* Equalizer */
+.eq-preset-pills { display: flex; flex-wrap: wrap; gap: 6px; }
+.eq-pill { padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface); color: var(--text-secondary); font-size: 11px; cursor: pointer; transition: all var(--transition); }
+.eq-pill:hover { background: var(--surface-2); color: #fff; }
+.eq-pill.active { background: var(--text); color: var(--bg); border-color: var(--text); font-weight: 600; }
+.eq-sliders-wrap { display: flex; justify-content: space-around; align-items: center; margin-top: 18px; padding: 14px 10px; background: var(--surface); border-radius: var(--radius-sm); border: 1px solid var(--border); }
+.eq-slider-col { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.eq-val { font-size: 10px; color: var(--text-muted); font-variant-numeric: tabular-nums; min-height: 14px; }
+.eq-v-slider { -webkit-appearance: slider-vertical; width: 24px; height: 100px; accent-color: var(--text); cursor: pointer; }
+.eq-label { font-size: 11px; font-weight: 500; color: var(--text-secondary); }
+
+/* Offline Badges & Actions */
+.track-offline-badge { display: inline-flex; align-items: center; gap: 3px; padding: 2px 7px; border-radius: 999px; background: rgba(34, 197, 94, 0.12); border: 1px solid rgba(34, 197, 94, 0.3); color: #4ade80; font-size: 10px; font-weight: 500; margin-left: 6px; flex-shrink: 0; }
+.pl-download-btn { display: inline-flex; align-items: center; gap: 6px; padding: 0 14px; height: 38px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface); color: var(--text-secondary); cursor: pointer; font-size: 12px; font-weight: 500; transition: all var(--transition); }
+.pl-download-btn:hover { background: var(--surface-2); color: #fff; border-color: var(--text-muted); }
+.pl-download-btn.downloaded { background: rgba(34, 197, 94, 0.15); border-color: rgba(34, 197, 94, 0.4); color: #4ade80; }
+.pl-download-btn.downloading { opacity: 0.7; pointer-events: none; }
 @media (max-width: 720px) { .health-grid { grid-template-columns: 1fr; } .health-card.wide { grid-column: auto; } .settings-shortcuts { grid-template-columns: 1fr; } }
+
 </style>
 </head>
 <body>
@@ -671,16 +711,21 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   <div class="fp-topbar">
     <span class="fp-context" id="fp-context">Now Playing</span>
     <div class="fp-topbar-actions">
+      <button class="fp-topbar-btn" id="fp-lyrics-btn" onclick="toggleFpLyrics()" title="Synced Lyrics"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg></button>
       <button class="fp-topbar-btn" onclick="fpToggleQueue()" title="Queue"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/></svg></button>
-
       <button class="fp-topbar-btn collapse" onclick="closeFullPlayer()" title="Collapse"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg></button>
     </div>
   </div>
-  <div class="fp-main">
+  <div class="fp-main" id="fp-main">
     <div class="fp-artwork-wrap">
       <div class="fp-artwork">
         <div class="fp-fallback-icon" id="fp-fallback"><svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>
         <img id="fp-img" src="" alt="" style="display:none">
+      </div>
+    </div>
+    <div class="fp-lyrics-wrap" id="fp-lyrics-wrap">
+      <div class="fp-lyrics-container" id="fp-lyrics-container">
+        <div class="fp-lyrics-status" id="fp-lyrics-status">Loading lyrics...</div>
       </div>
     </div>
     <div class="fp-meta">
