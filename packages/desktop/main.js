@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, globalShortcut, protocol, net } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, globalShortcut, protocol, net, Tray, Menu, nativeImage } = require('electron');
 const path = require('path');
 const http = require('http');
 const https = require('https');
@@ -41,6 +41,34 @@ function getTempPath(videoId, format = 'primary') {
   // distinct cache file.
   return path.join(TEMP_DIR, format === 'fallback' ? `${videoId}.fallback.m4a` : `${videoId}.m4a`);
 }
+
+// ── Permanent Offline Music Directory ──────────────────────────────────
+const OFFLINE_DIR = path.join(app?.getPath('userData') || app?.getPath('temp') || '/tmp', 'offline-music');
+try { require('fs').mkdirSync(OFFLINE_DIR, { recursive: true }); } catch {}
+const OFFLINE_INDEX_PATH = path.join(OFFLINE_DIR, 'offline-index.json');
+
+function loadOfflineIndex() {
+  try {
+    if (fs.existsSync(OFFLINE_INDEX_PATH)) {
+      const data = JSON.parse(fs.readFileSync(OFFLINE_INDEX_PATH, 'utf-8'));
+      return Array.isArray(data) ? data : [];
+    }
+  } catch {}
+  return [];
+}
+
+function saveOfflineIndex(list) {
+  try {
+    fs.writeFileSync(OFFLINE_INDEX_PATH, JSON.stringify(list, null, 2), 'utf-8');
+  } catch (e) {
+    console.warn('[offline] could not save index:', e.message);
+  }
+}
+
+function getOfflinePath(videoId) {
+  return path.join(OFFLINE_DIR, `${videoId}.m4a`);
+}
+
 
 function serveAudioFile(req, res, filePath) {
   const { size } = fs.statSync(filePath);
@@ -118,6 +146,220 @@ function unregisterMediaShortcuts() {
   for (const [accelerator] of mediaShortcutActions) globalShortcut.unregister(accelerator);
 }
 
+// ── System tray + customizable global hotkey ────────────────────────────
+// Closing the window hides Tuneless to the tray so the global hotkey keeps
+// working. Quit from the tray menu (or Ctrl+Q) to fully exit.
+let tray = null;
+let isQuitting = false;
+let customHotkey = null; // currently registered accelerator string
+
+function createTray() {
+  if (tray) return;
+  const iconPath = path.join(__dirname, 'assets', 'icon.png');
+  let icon;
+  try {
+    icon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 });
+  } catch {
+    icon = nativeImage.createEmpty();
+  }
+  tray = new Tray(icon);
+  tray.setToolTip('Tuneless');
+  const contextMenu = Menu.buildFromTemplate([
+    { label: 'Show Tuneless', click: () => showMainWindow() },
+    { type: 'separator' },
+    { label: 'Play / Pause', click: () => sendToRenderer('media:play-pause') },
+    { label: 'Next Track', click: () => sendToRenderer('media:next') },
+    { label: 'Previous Track', click: () => sendToRenderer('media:prev') },
+    { type: 'separator' },
+    { label: 'Quit Tuneless', click: () => { isQuitting = true; app.quit(); } },
+  ]);
+  tray.setContextMenu(contextMenu);
+  tray.on('click', () => {
+    if (mainWindow && mainWindow.isVisible()) mainWindow.hide();
+    else showMainWindow();
+  });
+}
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    return;
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function sendToRenderer(channel) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel);
+}
+
+let overlayWindow = null;
+
+function createOverlayWindow() {
+  if (overlayWindow && !overlayWindow.isDestroyed()) return;
+  overlayWindow = new BrowserWindow({
+    width: 580,
+    height: 490,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    hasShadow: true,
+    show: false,
+    icon: path.join(__dirname, 'assets', 'icon.png'),
+    webPreferences: {
+      preload: path.join(__dirname, 'preload-overlay.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+
+  overlayWindow.loadFile(path.join(__dirname, 'renderer', 'overlay.html'));
+
+  overlayWindow.on('blur', () => {
+    if (overlayWindow && !overlayWindow.isDestroyed()) {
+      overlayWindow.hide();
+    }
+  });
+}
+
+function showOverlayWindow() {
+  if (!overlayWindow || overlayWindow.isDestroyed()) {
+    createOverlayWindow();
+    overlayWindow.once('ready-to-show', () => {
+      syncAndShowOverlay();
+    });
+  } else {
+    syncAndShowOverlay();
+  }
+}
+
+function syncAndShowOverlay() {
+  if (!overlayWindow || overlayWindow.isDestroyed()) return;
+  overlayWindow.center();
+  overlayWindow.show();
+  overlayWindow.focus();
+
+  // If mainWindow doesn't exist yet, create it in the background
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    mainWindow.webContents.once('did-finish-load', () => {
+      mainWindow.webContents.send('overlay:request-state');
+    });
+  } else {
+    mainWindow.webContents.send('overlay:request-state');
+  }
+}
+
+function registerCustomHotkey(accelerator) {
+  // Unregister previous custom hotkey
+  if (customHotkey) {
+    try { globalShortcut.unregister(customHotkey); } catch {}
+    customHotkey = null;
+  }
+  if (!accelerator) return { ok: false, error: 'No hotkey set' };
+  try {
+    const registered = globalShortcut.register(accelerator, () => {
+      // Toggle Quick Launcher Overlay
+      if (overlayWindow && !overlayWindow.isDestroyed() && overlayWindow.isVisible()) {
+        overlayWindow.hide();
+      } else {
+        showOverlayWindow();
+      }
+    });
+    if (registered) {
+      customHotkey = accelerator;
+      console.log(`[hotkey] registered: ${accelerator}`);
+      return { ok: true };
+    } else {
+      return { ok: false, error: `Could not register "${accelerator}" — it may be in use by another app` };
+    }
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// IPC: renderer sends hotkey config on boot and when user changes it
+ipcMain.handle('hotkey:register', async (event, { accelerator }) => {
+  return registerCustomHotkey(accelerator);
+});
+
+ipcMain.handle('hotkey:unregister', async () => {
+  if (customHotkey) {
+    try { globalShortcut.unregister(customHotkey); } catch {}
+    customHotkey = null;
+  }
+  return { ok: true };
+});
+
+// IPC: Overlay HUD relays
+ipcMain.on('overlay:send-state', (event, state) => {
+  if (overlayWindow && !overlayWindow.isDestroyed()) {
+    overlayWindow.webContents.send('overlay:state', state);
+  }
+});
+
+ipcMain.on('overlay:play-playlist', (event, data) => {
+  if (overlayWindow && !overlayWindow.isDestroyed()) {
+    overlayWindow.hide();
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('overlay:play-playlist', data);
+  }
+});
+
+ipcMain.on('overlay:toggle-play', () => {
+  sendToRenderer('media:play-pause');
+});
+
+ipcMain.on('overlay:next-track', () => {
+  sendToRenderer('media:next');
+});
+
+ipcMain.on('overlay:prev-track', () => {
+  sendToRenderer('media:prev');
+});
+
+ipcMain.on('overlay:close', () => {
+  if (overlayWindow && !overlayWindow.isDestroyed()) {
+    overlayWindow.hide();
+  }
+});
+
+ipcMain.on('overlay:open-full-app', () => {
+  if (overlayWindow && !overlayWindow.isDestroyed()) {
+    overlayWindow.hide();
+  }
+  showMainWindow();
+});
+
+// IPC: Auto-start on system boot
+ipcMain.handle('autostart:get', async () => {
+  try {
+    const settings = app.getLoginItemSettings();
+    return settings.openAtLogin;
+  } catch (e) {
+    return false;
+  }
+});
+
+ipcMain.handle('autostart:set', async (event, { enabled }) => {
+  try {
+    app.setLoginItemSettings({
+      openAtLogin: !!enabled,
+      openAsHidden: true,
+      args: ['--hidden'],
+    });
+    const updated = app.getLoginItemSettings();
+    return { ok: true, enabled: updated.openAtLogin };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+
 // Shared by foreground playback and background preloading. A track may only
 // have one yt-dlp process writing its cache file at a time.
 const activeDownloads = new Map();
@@ -137,6 +379,17 @@ function startStreamServer() {
     const useFallback = query.get('format') === 'fallback';
     res.setHeader('Access-Control-Allow-Origin', '*');
     console.log(`[stream] request: /${videoId} ${useFallback ? '(fallback)' : '(primary)'}`);
+
+    // ── Check for offline downloaded permanent file first ──
+    const offlinePath = getOfflinePath(videoId);
+    if (fs.existsSync(offlinePath)) {
+      const stat = fs.statSync(offlinePath);
+      if (stat.size > 0) {
+        console.log(`[stream] serving offline downloaded file ${videoId} (${stat.size} bytes)`);
+        serveAudioFile(req, res, offlinePath);
+        return;
+      }
+    }
 
     // ── Check for cached temp file from a previous pipe download ──
     const tempPath = getTempPath(videoId, useFallback ? 'fallback' : 'primary');
@@ -233,14 +486,15 @@ function createWindow() {
   });
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 
-  // Show window only when fully rendered — prevents blank/white flash
+  // Show window only when fully rendered — prevents blank/white flash (unless started hidden)
+  const isHiddenLaunch = process.argv.includes('--hidden') || app.getLoginItemSettings().wasOpenedAsHidden;
   let shown = false;
   mainWindow.once('ready-to-show', () => {
-    if (!shown) { shown = true; mainWindow.show(); }
+    if (!shown && !isHiddenLaunch) { shown = true; mainWindow.show(); }
   });
-  // Fallback: if page doesn't render in 8s, show anyway (stream server may be downloading)
+  // Fallback: if page doesn't render in 8s, show anyway (unless hidden launch)
   setTimeout(() => {
-    if (!shown && mainWindow && !mainWindow.isDestroyed()) {
+    if (!shown && !isHiddenLaunch && mainWindow && !mainWindow.isDestroyed()) {
       shown = true;
       mainWindow.show();
     }
@@ -288,8 +542,14 @@ function createWindow() {
     }
   });
 
-  // Closing the window quits the app — no hidden background process.
-  mainWindow.on('close', () => {
+  // Closing the window hides it to the system tray so the global hotkey and
+  // playback keep working. Quit from the tray menu to fully exit.
+  mainWindow.on('close', (event) => {
+    if (!isQuitting) {
+      event.preventDefault();
+      mainWindow.hide();
+      return;
+    }
     // Ensure the stream server is torn down on the way out.
     if (streamServer) streamServer.close();
   });
@@ -306,11 +566,7 @@ if (!gotTheLock) {
     if (deepLink && mainWindow) {
       handleDeepLink(deepLink);
     }
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.show();
-      mainWindow.focus();
-    }
+    showMainWindow();
   });
 }
 
@@ -353,6 +609,8 @@ app.on('ready', () => {
   // Session is available. Registering both paths makes one headset press race
   // two independent play/pause handlers.
   registerMediaShortcuts();
+  createTray();
+  createOverlayWindow();
   try {
     startStreamServer();
   } catch (e) {
@@ -361,11 +619,16 @@ app.on('ready', () => {
   // Delay window creation slightly to let system settle after install
   setTimeout(() => createWindow(), 500);
 });
-app.on('window-all-closed', () => { app.quit(); });
-app.on('activate', () => { if (mainWindow) mainWindow.show(); });
+// Window is hidden to tray on close, so don't quit when all windows are closed.
+app.on('window-all-closed', () => { if (isQuitting) app.quit(); });
+app.on('activate', () => { showMainWindow(); });
 app.on('before-quit', () => {
+  isQuitting = true;
   app.isQuitting = true;
   globalShortcut.unregisterAll();
+  if (overlayWindow && !overlayWindow.isDestroyed()) {
+    try { overlayWindow.destroy(); } catch {}
+  }
   if (streamServer) streamServer.close();
 });
 
@@ -585,75 +848,11 @@ ipcMain.handle('auth:google', async (event, { supabaseUrl, redirectUrl }) => {
   });
 });
 
-// ── IPC: Spotify Playlist Import ────────────────────────────────────────
-ipcMain.handle('spotify:import-playlist', async (event, { clientId, clientSecret, playlistUrl }) => {
-  try {
-    // Extract playlist ID from URL
-    const match = playlistUrl.match(/playlist\/([a-zA-Z0-9]+)/);
-    if (!match) return { error: 'Invalid Spotify playlist URL' };
-    const playlistId = match[1];
-
-    // Get access token
-    const auth = Buffer.from(clientId + ':' + clientSecret).toString('base64');
-    const tokenData = await new Promise((resolve, reject) => {
-      const body = 'grant_type=client_credentials';
-      const req = https.request('https://accounts.spotify.com/api/token', {
-        method: 'POST',
-        headers: { 'Authorization': 'Basic ' + auth, 'Content-Type': 'application/x-www-urlencoded', 'Content-Length': body.length },
-      }, (res) => {
-        let d = ''; res.on('data', c => d += c);
-        res.on('end', () => { try { resolve(JSON.parse(d)); } catch { reject(new Error('Bad token response')); } });
-      });
-      req.on('error', reject);
-      req.write(body);
-      req.end();
-    });
-
-    if (!tokenData.access_token) return { error: 'Spotify auth failed' };
-
-    // Fetch playlist info
-    const plData = await new Promise((resolve, reject) => {
-      https.get(`https://api.spotify.com/v1/playlists/${playlistId}?fields=name,tracks.total`, {
-        headers: { 'Authorization': 'Bearer ' + tokenData.access_token },
-      }, (res) => {
-        let d = ''; res.on('data', c => d += c);
-        res.on('end', () => { try { resolve(JSON.parse(d)); } catch { reject(new Error('Bad playlist response')); } });
-      }).on('error', reject);
-    });
-
-    // Fetch all tracks (paginated, up to 500)
-    const tracks = [];
-    let offset = 0;
-    const limit = 100;
-    while (offset < Math.min(plData.tracks.total, 500)) {
-      const pageData = await new Promise((resolve, reject) => {
-        https.get(`https://api.spotify.com/v1/playlists/${playlistId}/tracks?offset=${offset}&limit=${limit}&fields=items(track(name,artists,album,duration_ms))`, {
-          headers: { 'Authorization': 'Bearer ' + tokenData.access_token },
-        }, (res) => {
-          let d = ''; res.on('data', c => d += c);
-          res.on('end', () => { try { resolve(JSON.parse(d)); } catch { reject(new Error('Bad tracks response')); } });
-        }).on('error', reject);
-      });
-      for (const item of (pageData.items || [])) {
-        const t = item.track;
-        if (!t) continue;
-        tracks.push({
-          name: t.name,
-          artist: t.artists.map(a => a.name).join(', '),
-          ytId: null,
-        });
-      }
-      offset += limit;
-    }
-
-    return { name: plData.name, trackCount: tracks.length, tracks };
-  } catch (e) {
-    return { error: e.message || 'Import failed' };
-  }
-});
-
 // ── IPC: Stream + search + resolve ───────────────────────────────
 async function downloadPrimaryAudio(videoId, reason = 'play') {
+  const offlinePath = getOfflinePath(videoId);
+  if (fs.existsSync(offlinePath) && fs.statSync(offlinePath).size > 0) return { cached: true, offline: true };
+
   const tempPath = getTempPath(videoId, 'primary');
   if (fs.existsSync(tempPath) && fs.statSync(tempPath).size > 0) return { cached: true };
 
@@ -718,6 +917,114 @@ ipcMain.handle('preload:stream', async (event, { videoId }) => {
     return { ok: false, error: e.message || 'Could not preload audio' };
   }
 });
+
+// ── IPC: Permanent Offline Music ─────────────────────────────────
+ipcMain.handle('offline:check', async (event, { videoId }) => {
+  if (!videoId) return false;
+  const p = getOfflinePath(videoId);
+  return fs.existsSync(p) && fs.statSync(p).size > 0;
+});
+
+ipcMain.handle('offline:list', async () => {
+  const index = loadOfflineIndex();
+  const valid = index.filter(item => {
+    const p = getOfflinePath(item.videoId || item.id);
+    return fs.existsSync(p) && fs.statSync(p).size > 0;
+  });
+  if (valid.length !== index.length) {
+    saveOfflineIndex(valid);
+  }
+  return valid;
+});
+
+ipcMain.handle('offline:delete', async (event, { videoId }) => {
+  if (!videoId) return { ok: false };
+  const p = getOfflinePath(videoId);
+  try {
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+  } catch {}
+  const index = loadOfflineIndex();
+  const filtered = index.filter(i => (i.videoId || i.id) !== videoId);
+  saveOfflineIndex(filtered);
+  return { ok: true };
+});
+
+ipcMain.handle('offline:download', async (event, track) => {
+  const videoId = track.videoId || track.id || track.ytId;
+  if (!videoId) return { ok: false, error: 'No videoId provided' };
+
+  const destPath = getOfflinePath(videoId);
+  if (fs.existsSync(destPath) && fs.statSync(destPath).size > 0) {
+    return { ok: true, cached: true };
+  }
+
+  // Check if it already exists in temp cache first — instant copy!
+  const tempPrimary = getTempPath(videoId, 'primary');
+  if (fs.existsSync(tempPrimary) && fs.statSync(tempPrimary).size > 0) {
+    try {
+      fs.copyFileSync(tempPrimary, destPath);
+      const index = loadOfflineIndex();
+      if (!index.some(i => (i.videoId || i.id) === videoId)) {
+        index.push({
+          videoId,
+          title: track.title || track.name || 'Unknown',
+          artist: track.artist || 'Unknown',
+          thumb: track.thumb || '',
+          duration: track.duration || '—',
+          savedAt: Date.now(),
+        });
+        saveOfflineIndex(index);
+      }
+      return { ok: true, copiedFromCache: true };
+    } catch (e) {
+      console.warn('[offline] copy failed, will download directly:', e.message);
+    }
+  }
+
+  // Otherwise download via yt-dlp directly to offline permanent path
+  try {
+    const ytdlpArgs = [
+      '-f', 'bestaudio[ext=m4a]/bestaudio[acodec!=opus]/bestaudio',
+      '-o', destPath,
+      '--no-warnings',
+      '--extractor-retries', '2',
+    ];
+    if (COOKIES_PATH) ytdlpArgs.push('--cookies', COOKIES_PATH);
+    ytdlpArgs.push(`https://www.youtube.com/watch?v=${videoId}`);
+
+    await new Promise((resolve, reject) => {
+      const proc = execFile(YTDLP_PATH, ytdlpArgs, { timeout: 180000 });
+      let stderrBuf = '';
+      proc.stderr.on('data', chunk => { stderrBuf += chunk.toString(); });
+      proc.on('close', code => {
+        if (code === 0 && fs.existsSync(destPath) && fs.statSync(destPath).size > 0) {
+          resolve();
+        } else {
+          reject(new Error(stderrBuf || 'yt-dlp failed (exit ' + code + ')'));
+        }
+      });
+      proc.on('error', reject);
+    });
+
+    const index = loadOfflineIndex();
+    if (!index.some(i => (i.videoId || i.id) === videoId)) {
+      index.push({
+        videoId,
+        title: track.title || track.name || 'Unknown',
+        artist: track.artist || 'Unknown',
+        thumb: track.thumb || '',
+        duration: track.duration || '—',
+        savedAt: Date.now(),
+      });
+      saveOfflineIndex(index);
+    }
+    return { ok: true };
+  } catch (err) {
+    try { if (fs.existsSync(destPath)) fs.unlinkSync(destPath); } catch {}
+    return { ok: false, error: err.message };
+  }
+});
+
 
 ipcMain.handle('search:youtube', async (event, { query, apiKey }) => {
   if (!apiKey) throw new Error('No API key');

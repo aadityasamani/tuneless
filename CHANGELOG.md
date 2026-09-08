@@ -2,7 +2,16 @@
 
 All notable changes to Tuneless will be documented here.
 
-## [2.0.7] — 2026-08-06
+## [2.2.0] — 2026-09-08
+
+### Added
+- **Global Hotkey Quick Launcher Overlay (Spotlight / Raycast HUD)**: Press `Alt+Space` (configurable) anytime to summon a sleek, frameless floating overlay. Hit `Enter` to instantly shuffle Liked Songs, or use `1`–`9` / arrow keys to shuffle any playlist without opening the full app. Includes live mini-controls and auto-dismisses on blur or `Escape`.
+- **System Tray & Windows Auto-Startup**: Closing the window hides Tuneless to the system tray so background playback and global hotkeys remain active. Added a "Launch on system startup" toggle in Settings to start Tuneless minimized in the tray on boot.
+- **Permanent Offline Music Playback**: Download playlists directly to local storage (`%APPDATA%/tuneless/offline-music/`) with visual `✓ Offline` badges and instant, 0s latency playback with zero internet required.
+- **Synced Lyrics View**: Real-time synchronized scrolling lyrics in the full player powered by LRCLIB, with interactive click-to-seek support.
+- **Audio Equalizer & Bass Boost**: 5-band parametric equalizer (60Hz, 250Hz, 1kHz, 4kHz, 12kHz) with custom sliders, presets, and a dedicated 🔥 Bass Boost (+8dB low-shelf) toggle.
+- **Playlist Management**: Added drag-and-drop track reordering in playlists and a quick-remove `×` hover button for tracks.
+
 
 ### Fixed
 - **New Playlist button does nothing**: Electron does not support the native browser
